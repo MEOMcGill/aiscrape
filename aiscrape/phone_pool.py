@@ -64,13 +64,22 @@ DEFAULT_CDP_PORT = 9222
 # How many AI Mode asks in a row may come back empty on one handset before it is
 # treated as walled and rotated away from.
 #
-# Rotating only on `blocked` was not enough: in the 2026-08-06 audit Google stopped
-# answering partway through a session and never showed a CAPTCHA, so `blocked` stayed
-# false on all 240 asks, no rotation ever fired, one phone absorbed the whole run and
-# the last three repeats of every query came back empty while five phones sat idle.
-# An unanswered ask is not proof of a bad phone -- but three in a row is the same
-# evidence a CAPTCHA would have given, arriving quietly.
+# Rotating only on `blocked` is not enough: Google can stop answering partway through
+# a session without ever showing a CAPTCHA, leaving `blocked` false, no rotation
+# firing, and one phone absorbing a whole run while the rest sit idle. An unanswered
+# ask is not proof of a bad phone -- but three in a row is the same evidence a CAPTCHA
+# would have given, arriving quietly.
 DRY_STREAK_BEFORE_ROTATE = 3
+
+# How many *different* prompts must come back empty on a handset that has never held
+# a ChatGPT conversation before it is left out of chat for the rest of the run. Two,
+# not one: a good phone does drop the occasional ask, and being wrong here costs the
+# farm a chat handset for the whole run.
+CHAT_STRIKES_BEFORE_EXCLUDING = 2
+# How many handsets one ChatGPT prompt may be moved across before its empty answer is
+# taken at face value and stored. Without it, a prompt ChatGPT genuinely will not
+# answer would walk the farm collecting a strike on every phone.
+MAX_HANDSETS_PER_CHAT_PROMPT = 3
 
 # Proactive rotation every 5 asks, and a jittered 5-10s between them. Against the live
 # farm (2026-08) a flat 2s gap with stay-until-walled saw the runway before a CAPTCHA
@@ -102,6 +111,13 @@ class SerialPool:
         # Handsets whose Google web session has already been probed this run, so a
         # phone that rests and is picked up again is not probed over and over.
         self._verified: set[str] = set()
+        # Whether a handset can hold a ChatGPT conversation. Kept apart from walling:
+        # a phone that cannot chat usually still serves Google, and walling it would
+        # cost the farm a Google handset to fix a ChatGPT problem.
+        self._chatgpt_ok: dict[str, bool] = {}
+        # Distinct prompts that have come back empty on a handset that has never
+        # answered one, keyed by serial.
+        self._chat_strikes: dict[str, set[str]] = {}
         self._lock = asyncio.Lock()
 
     @property
@@ -124,6 +140,37 @@ class SerialPool:
         async with self._lock:
             self._in_use.discard(serial)
             self._walled.add(serial)
+
+    async def chatgpt_state(self, serial: str) -> bool | None:
+        """False once this handset is out for chat, True once it has answered one."""
+        async with self._lock:
+            return self._chatgpt_ok.get(serial)
+
+    async def set_chatgpt_ok(self, serial: str, ok: bool) -> None:
+        async with self._lock:
+            self._chatgpt_ok[serial] = ok
+
+    async def note_chat_answer(self, serial: str) -> None:
+        """This handset held a conversation, so it is a working one."""
+        async with self._lock:
+            self._chatgpt_ok[serial] = True
+            self._chat_strikes.pop(serial, None)
+
+    async def note_chat_failure(self, serial: str, prompt: str) -> int:
+        """Record a failed ask, returning how many *distinct* prompts have failed here.
+
+        Distinct on purpose. One prompt failing across many handsets says something
+        about the prompt; one handset failing many prompts says something about the
+        handset, and only the second is grounds for dropping it.
+        """
+        async with self._lock:
+            self._chat_strikes.setdefault(serial, set()).add(prompt)
+            return len(self._chat_strikes[serial])
+
+    def chatgpt_snapshot(self) -> str:
+        ok = sum(1 for v in self._chatgpt_ok.values() if v)
+        bad = sum(1 for v in self._chatgpt_ok.values() if not v)
+        return f"{ok} can chat / {bad} cannot / {self.total - ok - bad} unproven"
 
     async def mark_verified(self, serial: str) -> None:
         """Note that this handset passed its sign-in probe for the rest of the run."""
@@ -170,12 +217,14 @@ class PhoneBackend:
                  chat_warmup_s: float = DEFAULT_CHAT_WARMUP_S,
                  chatgpt_login: bool = True,
                  signin_precheck: bool = True,
+                 chatgpt_probe: bool = True,
                  rest_after_asks: int | None = DEFAULT_REST_AFTER_ASKS,
                  ask_delay_min_s: float = DEFAULT_ASK_DELAY_MIN_S,
                  ask_delay_max_s: float = DEFAULT_ASK_DELAY_MAX_S,
                  label: str = "phone"):
         self._pool = pool
         self._signin_precheck = signin_precheck
+        self._chatgpt_probe = chatgpt_probe
         # Proactive, no-fault rotation: after this many asks, voluntarily hand the
         # phone back (see `_rest`) even though nothing went wrong. On by default --
         # pass None (or 0) to opt out and keep the old stay-until-walled behaviour.
@@ -345,7 +394,7 @@ class PhoneBackend:
             await self._close()
         await self._open()
 
-    async def _ask_rotating(self, surface: str, call, answered):
+    async def _ask_rotating(self, surface: str, call, answered, *, key: str = ""):
         """Run one ask, rotating handsets past a wall or a run of empty answers.
 
         Shared by every surface because the rotation rules are about the *phone*:
@@ -356,6 +405,7 @@ class PhoneBackend:
         """
         retried = False
         reasked = False
+        moved = 0
         while True:
             if self._session is None:
                 await self._open()
@@ -387,7 +437,20 @@ class PhoneBackend:
                 continue
             if answered(result):
                 self._dry[surface] = 0
+                if surface == "chatgpt" and self._chatgpt_probe:
+                    # It held a conversation, so it is a working chat handset and its
+                    # empty asks from here are the model's, not the phone's.
+                    await self._pool.note_chat_answer(self._serial)
                 return result
+            # An unproven chat handset is judged by this ask, since it is the first
+            # real one it has had; see `_chat_failure_verdict`.
+            if surface == "chatgpt" and self._chatgpt_probe \
+                    and moved < MAX_HANDSETS_PER_CHAT_PROMPT \
+                    and await self._chat_failure_verdict(key) == "elsewhere":
+                self._dry[surface] = 0
+                moved += 1
+                await self._rest()   # not walled: it still serves Google
+                continue
             # An ask that produced nothing. One is ordinary; a run of them means this
             # handset has stopped answering, which Google does WITHOUT ever showing a
             # CAPTCHA. Rotate and re-ask once, so a genuinely unanswerable prompt
@@ -417,11 +480,52 @@ class PhoneBackend:
         walls are independent of Google's, which is why the dry streak is counted
         per surface -- a phone Google has stopped answering usually still chats.
         """
+        await self._skip_chat_incapable()
         return await self._ask_rotating(
             "chatgpt",
             lambda: self._chatgpt.ask(prompt),
             lambda r: bool(r.response),
+            key=prompt,
         )
+
+    async def _skip_chat_incapable(self) -> None:
+        """Move off a handset already known not to hold ChatGPT conversations."""
+        if not self._chatgpt_probe:
+            return
+        for _ in range(max(1, self._pool.total)):
+            if self._session is None:
+                await self._open()
+            if await self._pool.chatgpt_state(self._serial) is not False:
+                return
+            logger.info(f"[{self._label}] {self._serial} is out for chat "
+                        f"({self._pool.chatgpt_snapshot()}); trying another handset")
+            await self._rest()
+        raise PhoneFarmExhausted(
+            f"no handset in the farm can hold a ChatGPT conversation "
+            f"({self._pool.chatgpt_snapshot()})")
+
+    async def _chat_failure_verdict(self, prompt: str) -> str:
+        """What to do about a ChatGPT ask that came back empty: store it, or re-ask.
+
+        The handset's first real ask is its capability test -- there is no throwaway
+        ask, so finding out costs nothing that was not being asked anyway. Until a
+        handset has answered one, its empty asks are treated as being about the phone:
+        they are re-asked elsewhere rather than written down as answers the model did
+        not give. Once it has answered, it has proved itself and its empty asks are
+        the model's, so they store as before.
+        """
+        serial = self._serial
+        strikes = await self._pool.note_chat_failure(serial, prompt)
+        if await self._pool.chatgpt_state(serial):
+            return "store"
+        if strikes >= CHAT_STRIKES_BEFORE_EXCLUDING:
+            await self._pool.set_chatgpt_ok(serial, False)
+            logger.error(
+                f"[{self._label}] {serial}: {strikes} different prompts have come "
+                f"back empty and it has never answered one, so it is out of ChatGPT "
+                f"asks for this run ({self._pool.chatgpt_snapshot()}). Its Google "
+                f"asks are unaffected.")
+        return "elsewhere"
 
     async def search_normal(self, prompt: str, top_n: int = 10):
         """Google's normal top results for `prompt`, rotating phones past any CAPTCHA.

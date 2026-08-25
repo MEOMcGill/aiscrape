@@ -96,9 +96,9 @@ DEFAULT_SEARCH_SETTLE_MS = 2_500
 
 # What AI Mode puts in the answer container when it declined to generate one. It looks
 # like prose, is long enough to pass the readiness bar, and carries citations, so
-# without this check it is stored as a real answer -- 8 rows of the 2026-08-06 audit
-# were exactly this before it existed. Not a CAPTCHA: the session is still good, the
-# ask just produced nothing, so it counts as a failed ask rather than a block.
+# without this check it is stored as a real answer. Not a CAPTCHA: the session is
+# still good, the ask just produced nothing, so it counts as a failed ask rather than
+# a block.
 #
 # Matched on "...wasn't generated" rather than the "Something went wrong" these
 # messages open with, because that opener is a phrase an answer could plausibly use
@@ -1151,11 +1151,9 @@ def _ai_mode_page(pages: list[dict], prompt: str) -> dict | None:
 
     The counterpart of `_plain_search_page`, and it exists for the same reason: one
     Chrome serves every query on a phone, so "the `udm=50` tab" is not a unique thing.
-    It used to take the first `udm=50` tab in CDP's list with no check of which query
-    it belonged to, which is fine on a clean phone and wrong on a real one -- the
-    2026-08-06 audit ran against handsets carrying hundreds of leftover AI Mode tabs
-    and 71 of 180 asks came back empty, while plain search, which has had this guard
-    from the start, went 60 for 60.
+    Taking the first `udm=50` tab in CDP's list with no check of which query it
+    belongs to is fine on a clean phone and wrong on a real one: a handset that has
+    accumulated leftover AI Mode tabs answers a large share of asks with an empty.
 
     A stale tab could not corrupt an answer (`_clean_overview_text` cuts at the echo of
     *this* prompt and finds none in someone else's page), so the damage was empties
