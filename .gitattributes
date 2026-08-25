@@ -1,0 +1,14 @@
+# Git for Windows ships core.autocrlf=true, so a clone there checks every file out
+# with CRLF while the index holds LF. The scrape runs from WSL and from Windows
+# Python against that one worktree, and the two gits then disagree about whether
+# anything is modified -- `git status` shows the whole tree dirty and a pull needs
+# a stash. Pinning the working-tree ending settles it for every clone.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary
+*.zst binary
+*.parquet binary

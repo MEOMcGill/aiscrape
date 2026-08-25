@@ -1,0 +1,58 @@
+[project]
+name = "aiscrape"
+version = "0.1.0"
+description = "Browser-automation scrapers for AI products: Google AI Mode + the ChatGPT/Claude/Gemini/Meta web UIs, on a shared camoufox + Playwright stack"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Media Ecosystem Observatory" }]
+requires-python = ">=3.11"
+keywords = [
+    "ai-overview", "google-ai-mode", "chatgpt", "claude", "gemini",
+    "web-scraping", "browser-automation", "playwright", "camoufox",
+    "android", "adb", "chrome-devtools-protocol", "research",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "camoufox[geoip]==0.4.11",
+    "playwright==1.59.0",
+    "aiosqlite>=0.20",
+    "click>=8.1",
+    "tabulate>=0.9",
+    "loguru>=0.7",
+    "websocket-client>=1.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
+
+[project.urls]
+Homepage = "https://github.com/MEOMcGill/aiscrape"
+
+[project.scripts]
+aiscrape = "aiscrape.cli:cli"
+
+# Versions are pinned deliberately: camoufox 0.4.11 / playwright 1.59.0 match the
+# cached camoufox Firefox build under ~/.cache/camoufox. Newer playwright breaks
+# with a `Browser.setDefaultViewport` protocol error. Don't bump them casually.
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aiscrape"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
