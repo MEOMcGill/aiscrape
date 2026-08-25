@@ -1075,9 +1075,9 @@ def _parse_citations(citations: list[dict], anchors: list[dict]) -> list[Referen
 
     An empty list is the ordinary case, not a parsing failure: ChatGPT cites when it
     has searched and stays silent when it answered from the model. Deliberately the
-    same `Reference` shape the Google surfaces produce, so `query_scrape` writes one
-    row schema and "what ChatGPT cites" against "what Google ranks" is a query over
-    one index rather than a join.
+    same `Reference` shape the Google surfaces produce, so a caller writes one row
+    schema and "what ChatGPT cites" against "what Google ranks" is a query over one
+    index rather than a join.
     """
     by_url: dict[str, Reference] = {}
     order: list[str] = []

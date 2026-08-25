@@ -189,7 +189,7 @@ python -m aiscrape.phone_chatgpt --serial R58MEXAMPLE \
 
 ### Driving many phones directly
 
-`phone_pool` is what `query_scrape` uses, and it is usable on its own: a shared
+`phone_pool` is what a batch runner sits on, and it is usable on its own: a shared
 `SerialPool` over the farm's serials, an async `PhoneBackend` that wraps the
 synchronous phone scraper in threads, and rotation to the next handset when one
 trips a CAPTCHA (raising `PhoneFarmExhausted` when they are all walled).
