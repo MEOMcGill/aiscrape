@@ -1,18 +1,6 @@
 # aiscrape
 
-Browser-automation scrapers for AI products, on a shared
-[camoufox](https://github.com/daijro/camoufox) + Playwright stack. Built for
-research that audits what AI products say and cite: ask a prompt on a live
-surface, get back the answer text and the sources behind it, in one shape across
-every surface.
-
-**camoufox + Playwright, not one or the other:** camoufox is a *patched Firefox
-build* that spoofs fingerprints (the browser); [Playwright](https://playwright.dev)
-is the *automation API* you drive it with (`page.locator(...)`, `page.goto(...)`).
-`AsyncCamoufox` just launches camoufox and hands you a normal Playwright browser,
-so the scraper code is ordinary Playwright. playwright is pinned to `1.59.0`
-because the version must match camoufox's expectations (newer breaks with a
-`Browser.setDefaultViewport` protocol error).
+Browser-automation scrapers for AI products. Built for auditing AI products: send a prompt to multiple products, get back the answer text and the sources behind it.
 
 Two scrapers:
 
@@ -175,10 +163,6 @@ python -m aiscrape.phone_farm --serial R58MEXAMPLE \
     "how does photosynthesis work"
 ```
 
-Throughput caveat: handsets sharing one WiFi share one egress IP, and Google's
-burst limit is largely IP-level — rotating phones spreads the *per-account* load,
-not the *per-IP* load. See the `phone-farm` skill for driving the handsets.
-
 ### ChatGPT on the same phones
 
 `PhoneChatGPTScraper` (`aiscrape.phone_chatgpt`) asks **chatgpt.com** in that
@@ -203,102 +187,6 @@ python -m aiscrape.phone_chatgpt --serial R58MEXAMPLE \
     "how does photosynthesis work"
 ```
 
-#### Signing the phones in
-
-Each handset signs itself into ChatGPT with **the Google account it already
-carries**, so every phone gets its own ChatGPT account and no password is stored
-anywhere:
-
-```bash
-# once per phone; a no-op if it's already signed in
-python -m aiscrape.phone_chatgpt --serial R58MEXAMPL2 --login \
-    --ssh-host phone-farm --adb 'C:\platform-tools\adb.exe'
-
-# what a phone's state is
-python -m aiscrape.phone_chatgpt --serial R58MEXAMPL2 --status ...
-```
-
-`log_in` walks chatgpt.com → "Continue with Google" → the account chooser → OAuth
-consent → (first time only) ChatGPT's signup form, as a state machine over what is
-on screen rather than a fixed script, because the steps vary: the signup only
-appears for a Google account ChatGPT has never seen, and the form comes in two
-shapes (a birthday, or a plain "Age"). It fills that form with the Google profile's
-display name and `2000-01-01` — digits in the name are spelled out ("Lab Phone 6"
-→ "Lab Phone Six") because OpenAI's validator rejects them.
-
-`PhoneBackend` calls `ensure_logged_in` when it opens a phone (`phone.chatgpt_login`,
-on by default), so a scheduled run keeps itself signed in; a login that fails is
-logged and the phone asks anonymously instead of being dropped.
-
-**Signing in is what makes this reliable.** Anonymous asks hit OpenAI's visitor
-check — *"Chat verification could not be completed"* — and that check can go
-permanently hostile on an individual handset: re-warming, retrying and clearing
-chatgpt.com's site data over CDP all leave it walled. **Signing the phone in clears
-it.** Anonymous still works and needs no setup, so it stays the fallback; a wall
-that survives everything is reported as `blocked` like a Google CAPTCHA, and
-`PhoneBackend` rotates past it.
-
-Two things the login needs that ordinary scraping does not, both because it
-*clicks* pages rather than only reading them: the handset has to be **unlocked**
-(`session.unlock()` swipes past a swipe-only lock screen) and **Chrome has to be the
-app on screen** (`session.foreground_chrome()`). Android freezes the tabs of a
-backgrounded browser, so with the notification shade left pulled down over Chrome
-the account chooser sits there doing nothing while every click is silently
-discarded. Typing goes through CDP (`Input.insertText`), not `adb input text`, for
-the same reason — keystrokes go to whatever is on the display.
-
-Other things worth knowing before reading the data:
-
-- **Two different web apps.** Signed out, chatgpt.com serves a mobile-only shell and
-  `?q=` both fills the composer and submits. Signed in, it serves the ordinary
-  ChatGPT web app (the markup `chatbots.py` drives on the desktop) and `?q=` only
-  *prefills* — the scraper presses send itself. `served_model` is filled in only
-  when signed in (e.g. `gpt-5-6`); the anonymous shell names no model at all.
-- **The site must be warm before an anonymous ask.** The visitor check runs just
-  after the page loads and `?q=` submits the moment it loads, so an ask on a cold
-  Chrome loses that race. The scraper opens chatgpt.com and waits (`warmup_s`, 8s)
-  once per session first, and retries a wall once with a re-warm.
-- **Citations are not links when signed out.** ChatGPT cites only when it has searched the web, and
-  renders each citation as a chip carrying `{attribution, title, url, snippet}` as
-  JSON rather than as an `<a>` — so an answer with sources has no anchors in its
-  prose at all. Signed in they *are* ordinary anchors, stamped
-  `utm_source=chatgpt.com` (stripped, so a cited URL compares equal to the same page
-  ranked by Google). Either way `references` is empty when ChatGPT answered from the
-  model rather than the web, which is the ordinary case and not a parse failure.
-
-Both scrapers can share one handset — take a `PhoneChromeSession` and hand it to
-each, since the CDP tunnel binds a port a second session would collide with:
-
-```python
-from aiscrape import PhoneChromeSession, PhoneChatGPTScraper, PhoneFarmAIOverviewScraper
-
-with PhoneChromeSession("R58MEXAMPLE", ssh_host="phone-farm") as phone:
-    google, chatgpt = (PhoneFarmAIOverviewScraper(session=phone),
-                       PhoneChatGPTScraper(session=phone))
-    ai = google.search("...")
-    gpt = chatgpt.ask("...")
-```
-
-`PhoneBackend` (in `phone_pool`) already does exactly that, so a pooled run gets
-`search`, `search_normal` and `chat` off one phone with one rotation policy.
-
-The other chatbots (Claude / Gemini / Meta) still need a Playwright `Page` from a
-camoufox context with the saved `storage_state`:
-
-```python
-from aiscrape import (
-    new_camoufox, PLATFORM_URLS, start_fresh_conversation, send_to_claude,
-    warm_chatbot_from_firefox,
-)
-
-async with new_camoufox(headless=True) as browser:
-    ctx = await browser.new_context(storage_state="auth/claude.json")
-    await warm_chatbot_from_firefox(ctx, "claude")   # keep the session warm
-    page = await ctx.new_page()
-    await start_fresh_conversation(page, PLATFORM_URLS["claude"])
-    reply = await send_to_claude(page, "Say hello in exactly five words.")
-```
-
 ### Driving many phones directly
 
 `phone_pool` is what `query_scrape` uses, and it is usable on its own: a shared
@@ -318,15 +206,3 @@ print(pool.snapshot())     # "2 free / 1 in use / 0 walled"
 Each worker gets its own CDP port (`phone.cdp_port` base + i), because the tunnel
 binds that port both locally and via `adb forward` on the farm host.
 
-## Notes
-
-- **Paths are CWD-relative.** `auth/`, `results/` resolve against the current
-  working directory — run commands from the repo whose session/output you want.
-- **Versions are pinned deliberately.** camoufox `0.4.11` / playwright `1.59.0`
-  match the cached camoufox Firefox build under `~/.cache/camoufox`; newer
-  playwright breaks with a `Browser.setDefaultViewport` protocol error.
-- **A logged-in session is mandatory for Google** (it CAPTCHAs fresh automated
-  browsers). Re-run `aiscrape.auth --platform google` when scrapes come back
-  `blocked=True`.
-- **DOM selectors are fragile.** Google and the chatbot products change their
-  markup periodically; re-inspect with `probe.py` before editing selectors.
