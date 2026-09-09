@@ -461,6 +461,14 @@ class PhoneBackend:
                 await self._open()
             elif self._rest_after and self._asks_on_current >= self._rest_after:
                 await self._rest()
+            # After the handset has been settled, not before the loop: every path
+            # back to the top of this loop can have changed phones -- the rest above,
+            # a rotate past a wall, a chat verdict moving the prompt on -- and the
+            # ask below goes to whichever one we now hold. Checking only on the way
+            # in let the proactive rest hand a fresh prompt to a handset already
+            # ruled out of chat, once every `rest_after_asks`.
+            if surface == "chatgpt" and self._chatgpt_probe:
+                await self._skip_chat_incapable()
             self._asks_on_current += 1
             try:
                 result = await asyncio.to_thread(call)
@@ -529,8 +537,10 @@ class PhoneBackend:
         verification wall and the anonymous usage cap both arrive as `blocked`. The
         walls are independent of Google's, which is why the dry streak is counted
         per surface -- a phone Google has stopped answering usually still chats.
+
+        Handsets already out for chat are skipped inside `_ask_rotating`, which is
+        the only place that knows which one is about to be asked.
         """
-        await self._skip_chat_incapable()
         return await self._ask_rotating(
             "chatgpt",
             lambda: self._chatgpt.ask(prompt),
