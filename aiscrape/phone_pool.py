@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 
 from aiscrape.logger import logger
 from aiscrape.phone_chatgpt import PhoneChatGPTScraper
@@ -81,6 +82,13 @@ CHAT_STRIKES_BEFORE_EXCLUDING = 2
 # answer would walk the farm collecting a strike on every phone.
 MAX_HANDSETS_PER_CHAT_PROMPT = 3
 
+# How long a walled handset is left alone before the farm will try it again. A
+# CAPTCHA is a property of the session and it decays; treating it as permanent is
+# what turns "one phone tripped a wall" into "this run is over" on a small farm.
+# Only reached for when nothing else is free, so a healthy farm never re-tests.
+# 0 disables revival, restoring the walled-for-the-session behaviour.
+DEFAULT_WALL_COOLDOWN_S = 30 * 60
+
 # Proactive rotation every 5 asks, and a jittered 5-10s between them. Against the live
 # farm (2026-08) a flat 2s gap with stay-until-walled saw the runway before a CAPTCHA
 # shrink cycle over cycle, while rotation at a flat 10s carried a 1400+ query sweep
@@ -93,20 +101,29 @@ DEFAULT_ASK_DELAY_MAX_S = 10.0
 
 
 class PhoneFarmExhausted(RuntimeError):
-    """Every phone in the farm has been walled (CAPTCHA) this session."""
+    """Every phone in the farm is walled (CAPTCHA), and none has cooled down yet."""
 
 
 class SerialPool:
     """Shared allocator over the farm's serials.
 
     A phone is *checked out* while a worker holds it, *walled* once it trips a
-    CAPTCHA (never handed out again this session), and returned to the free list
-    when a worker closes it cleanly.
+    CAPTCHA, and returned to the free list when a worker closes it cleanly.
+
+    A wall is timed rather than permanent: once every other handset is spoken for,
+    one whose wall has aged past `wall_cooldown_s` is offered again. Walls decay,
+    and on a farm of a few phones treating them as final ends the run the first
+    time they all trip -- with the bank unfinished and no way back inside the run.
+    Revival is a last resort, so a farm with anything free rotates exactly as before.
     """
 
-    def __init__(self, serials: list[str]):
+    def __init__(self, serials: list[str], *,
+                 wall_cooldown_s: float = DEFAULT_WALL_COOLDOWN_S):
         self._free = list(serials)
-        self._walled: set[str] = set()
+        self._wall_cooldown_s = max(0.0, float(wall_cooldown_s))
+        # serial -> when it was walled, on the monotonic clock so a system clock
+        # change mid-run cannot make a wall look hours old.
+        self._walled: dict[str, float] = {}
         self._in_use: set[str] = set()
         # Handsets whose Google web session has already been probed this run, so a
         # phone that rests and is picked up again is not probed over and over.
@@ -128,10 +145,41 @@ class SerialPool:
         return (f"{len(self._free)} free / {len(self._in_use)} in use / "
                 f"{len(self._walled)} walled")
 
+    def _revive_walled(self) -> list[str]:
+        """Move handsets whose wall has aged out back to the free list.
+
+        Caller holds the lock. Oldest wall first, so the phone with the best chance
+        of having recovered is the one tried.
+        """
+        if not self._wall_cooldown_s:
+            return []
+        now = time.monotonic()
+        due = sorted(
+            (t, serial) for serial, t in self._walled.items()
+            if now - t >= self._wall_cooldown_s
+        )
+        for _, serial in due:
+            del self._walled[serial]
+            self._free.append(serial)
+        return [serial for _, serial in due]
+
     async def acquire(self) -> str:
         async with self._lock:
             if not self._free:
-                raise PhoneFarmExhausted(f"no phone available ({self.snapshot()})")
+                # Last resort: a healthy farm never gets here, so this cannot
+                # disturb the ordinary rotation.
+                revived = self._revive_walled()
+                if revived:
+                    logger.info(
+                        f"[phone] wall cooldown elapsed on {', '.join(revived)}; "
+                        f"trying {'them' if len(revived) > 1 else 'it'} again "
+                        f"({self.snapshot()})")
+            if not self._free:
+                raise PhoneFarmExhausted(
+                    f"no phone available ({self.snapshot()}"
+                    + (f", none walled longer than {self._wall_cooldown_s:.0f}s"
+                       if self._walled and self._wall_cooldown_s else "")
+                    + ")")
             serial = self._free.pop(0)
             self._in_use.add(serial)
             return serial
@@ -139,7 +187,9 @@ class SerialPool:
     async def wall(self, serial: str) -> None:
         async with self._lock:
             self._in_use.discard(serial)
-            self._walled.add(serial)
+            # Re-walling restarts the clock, which is what a handset that came back
+            # and tripped again has earned.
+            self._walled[serial] = time.monotonic()
 
     async def chatgpt_state(self, serial: str) -> bool | None:
         """False once this handset is out for chat, True once it has answered one."""
@@ -582,17 +632,21 @@ def discover_serials(*, serials: list[str] | None = None,
 
 def open_phone_backend(*, serials: list[str] | None = None,
                        exclude_serials: list[str] | None = None,
-                       cdp_port: int = DEFAULT_CDP_PORT, **kwargs) -> PhoneBackend:
+                       cdp_port: int = DEFAULT_CDP_PORT,
+                       wall_cooldown_s: float = DEFAULT_WALL_COOLDOWN_S,
+                       **kwargs) -> PhoneBackend:
     """One phone at a time, rotating through the farm on CAPTCHA."""
     pool = SerialPool(discover_serials(serials=serials, exclude=exclude_serials,
                                        ssh_host=kwargs.get("ssh_host"),
-                                       adb=kwargs.get("adb")))
+                                       adb=kwargs.get("adb")),
+                      wall_cooldown_s=wall_cooldown_s)
     return PhoneBackend(pool, cdp_port=cdp_port, label="phone", **kwargs)
 
 
 def open_phone_workers(n: int, *, serials: list[str] | None = None,
                        exclude_serials: list[str] | None = None,
                        cdp_port: int = DEFAULT_CDP_PORT,
+                       wall_cooldown_s: float = DEFAULT_WALL_COOLDOWN_S,
                        **kwargs) -> tuple[list[PhoneBackend], SerialPool]:
     """`n` concurrent phone workers sharing one SerialPool.
 
@@ -609,7 +663,7 @@ def open_phone_workers(n: int, *, serials: list[str] | None = None,
     found = discover_serials(serials=serials, exclude=exclude_serials,
                              ssh_host=kwargs.get("ssh_host"), adb=kwargs.get("adb"))
     n = max(1, min(n, len(found)))
-    pool = SerialPool(found)
+    pool = SerialPool(found, wall_cooldown_s=wall_cooldown_s)
     workers = [
         PhoneBackend(pool, cdp_port=cdp_port + i, label=f"phone{i + 1}", **kwargs)
         for i in range(n)
