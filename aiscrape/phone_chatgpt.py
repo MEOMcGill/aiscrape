@@ -734,6 +734,13 @@ class PhoneChatGPTScraper:
             self.session.ensure_visible()
             self.session.activate(page)
             if step == "done":
+                # "You're all set" is the last step of *creating* an account, and it
+                # appears while another tab already shows the signed-in app -- which
+                # outranks it, so the flow reaches `done` with the gate still open
+                # behind it. Whatever is left open is what the next run's
+                # `is_logged_in` reads, and a stranded gate makes a signed-in phone
+                # report itself signed out on every handset pick from then on.
+                self._dismiss_welcome()
                 logger.info(f"[{self.serial}] chatgpt signed in as {email}")
                 # Spent sign-in tabs, closed so the next run does not have to rank
                 # its way past them.
@@ -817,10 +824,31 @@ class PhoneChatGPTScraper:
                      if "google.com" in p.get("url", "") and "/sorry/" not in p.get("url", "")),
                     None)
         data = self.session.evaluate(page, _GOOGLE_NAME_JS) if page else None
+        if page:
+            # Closed here rather than left for a backlog sweep: the Google one only
+            # matches search tabs, so these accumulated one per login attempt.
+            self.session.close_tab(page.get("id") or "")
         name = (data or {}).get("name", "")
         if name and email.split("@")[0] not in name:
             return name
         return ""
+
+    def _dismiss_welcome(self) -> None:
+        """Click through any "You're all set" page still open on this phone.
+
+        Every tab, not just the best-ranked one: the gate is reached once per
+        account and is easy to leave behind, and clicking a Continue that is not
+        there costs nothing.
+        """
+        for page in self.session.pages():
+            if CHATGPT_HOST not in page.get("url", ""):
+                continue
+            state = self.session.evaluate(page, _LOGIN_STATE_JS)
+            if not state or self._login_step(state) != "welcome":
+                continue
+            logger.debug(f"[{self.serial}] closing the 'you're all set' gate")
+            self.session.activate(page)
+            self.session.evaluate(page, _CLICK_BY_TEXT_JS % json.dumps("continue"))
 
     def _login_step(self, state: dict) -> str:
         """Which step of the sign-in flow the page on screen is at."""
