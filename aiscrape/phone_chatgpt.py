@@ -548,6 +548,11 @@ class PhoneChatGPTScraper:
 
     def _ask_once(self, prompt: str) -> ChatResult:
         self.prepare()
+        # Before every ask, not once per session: the display times out mid-run and
+        # the keyguard comes back over Chrome. A tab behind it is frozen, so the ask
+        # opens its conversation and then never paints the reply -- which arrives
+        # here as an answer turn that rendered empty, on a handset that looks fine.
+        self.session.ensure_visible()
         scraped_at = now_iso()
         self.session.launch(CHATGPT_ASK_URL.format(q=quote_plus(prompt)))
 
@@ -723,7 +728,10 @@ class PhoneChatGPTScraper:
                 self.session.launch(CHATGPT_HOME_URL)
                 time.sleep(3)
                 continue
-            # Foreground it before touching it: a frozen tab ignores clicks.
+            # Foreground it before touching it: a frozen tab ignores clicks. Both
+            # halves matter -- the right tab within Chrome, and Chrome itself out
+            # from under a lock screen that has come back.
+            self.session.ensure_visible()
             self.session.activate(page)
             if step == "done":
                 logger.info(f"[{self.serial}] chatgpt signed in as {email}")
@@ -861,7 +869,26 @@ class PhoneChatGPTScraper:
             # fills.
             self.session.type_keys(page, birthday.replace("-", ""))
         time.sleep(1)
-        self.session.evaluate(page, _CLICK_BY_TEXT_JS % json.dumps("finish creating account"))
+        if not self._submit_signup(page):
+            logger.warning(f"[{self.serial}] the signup form is filled in but nothing "
+                           "on it could be clicked to submit; the flow will stall here")
+
+    def _submit_signup(self, page: dict) -> bool:
+        """Press the signup form's submit control. True if something was clicked.
+
+        By role before by words, because OpenAI relabels the button (it reads
+        "Continue" now, and read "Finish creating account" before). Matching only
+        the words turned a form that was filled in correctly into a flow that
+        stalled with the finished form on screen -- the click helper reports that
+        it found nothing, so the wording is worth failing loudly about.
+        """
+        for js in (_CLICK_SELECTOR_JS % json.dumps('button[type="submit"], '
+                                                   'input[type="submit"]'),
+                   _CLICK_BY_TEXT_JS % json.dumps("finish creating account"),
+                   _CLICK_BY_TEXT_JS % json.dumps("continue")):
+            if (self.session.evaluate(page, js) or {}).get("clicked"):
+                return True
+        return False
 
     def _furthest_flow_page(self) -> tuple[dict | None, dict, str]:
         """The open tab that is furthest along the sign-in flow, and its state.
