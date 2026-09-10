@@ -885,6 +885,11 @@ class PhoneFarmAIOverviewScraper:
     def search(self, prompt: str) -> AIOverviewResult:
         """Submit one prompt to AI Mode on the phone, return the parsed answer."""
         self.session.require_open()
+        # Google survives a lock screen far better than ChatGPT does -- its answer is
+        # mostly in the first paint, where ChatGPT's arrives afterwards -- but "far
+        # better" is not "unaffected", and a run whose remaining asks are all Google
+        # has nothing else clearing the keyguard between them.
+        self.session.ensure_visible()
         scraped_at = now_iso()
         self.session.launch(AI_MODE_URL.format(q=quote_plus(prompt)))
 
@@ -1008,6 +1013,7 @@ class PhoneFarmAIOverviewScraper:
         query -- and also what makes them share a CAPTCHA budget.
         """
         self.session.require_open()
+        self.session.ensure_visible()
         scraped_at = now_iso()
         self.session.launch(SEARCH_URL.format(q=quote_plus(prompt)))
 
