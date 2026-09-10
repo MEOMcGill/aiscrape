@@ -592,16 +592,21 @@ class PhoneChromeSession:
                 logger.debug(f"[{self.serial}] /json/list failed: {e}")
             return []
 
-    def evaluate(self, page: dict, expression: str) -> dict | None:
+    def evaluate(self, page: dict, expression: str,
+                 timeout: float = 25.0) -> dict | None:
         """Run one JS expression in `page` and return its decoded JSON value.
 
         None on any transport failure, so a caller polling a page it just launched
         treats "the tab is not answering yet" the same as "not ready yet".
+
+        Raise `timeout` for an expression that does work of its own rather than
+        reading the DOM. Past the default it comes back as a transport failure --
+        indistinguishable from a dead tab, and saying nothing about what it waited for.
         """
         if not page or "webSocketDebuggerUrl" not in page:
             return None
         try:
-            value = _cdp_evaluate(page["webSocketDebuggerUrl"], expression)
+            value = _cdp_evaluate(page["webSocketDebuggerUrl"], expression, timeout=timeout)
         except Exception as e:  # noqa: BLE001
             if self.debug:
                 logger.debug(f"[{self.serial}] CDP eval failed: {e}")

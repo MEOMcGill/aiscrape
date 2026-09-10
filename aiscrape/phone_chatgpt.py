@@ -121,6 +121,21 @@ _GOOGLE_NAME_JS = r"""
 """
 
 
+def _epoch(value) -> float:
+    """A conversation timestamp as a unix float, from either shape the API uses.
+
+    The list endpoint gives ISO ("2026-09-10T22:00:27.084180Z"), the conversation
+    itself a float. Unparseable reads as 0 rather than raising -- an odd timestamp on
+    one conversation must not stop a recovery.
+    """
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return datetime.fromisoformat(str(value)).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _local_part(email: str) -> str:
     """"labphone009@gmail.com" -> "Labphone009" — the last-resort account name."""
     return (email.split("@")[0] or email).capitalize()
@@ -251,6 +266,22 @@ _CHAT_EXTRACT_JS = r"""
 # account walks five or six pages, each with its own load: the phone that timed out at
 # 150s was progressing normally, just not finished.
 LOGIN_TIMEOUT_S = 300
+
+# Conversations per list request. The endpoint's own maximum.
+HISTORY_PAGE = 100
+
+# How long one batch of conversation fetches may take. Well past an ordinary CDP read,
+# because the work is the phone's -- a batch is that many HTTP requests made and
+# parsed on the handset. At the 25s default every batch came back "no response".
+HISTORY_TIMEOUT_S = 180.0
+
+# Between conversation fetches, inside the page. The account rate limits them, and a
+# batch fired off at once is enough concurrency to trip it on its own.
+HISTORY_FETCH_PAUSE_MS = 400
+
+# How long to wait before asking again for conversations the account refused with a
+# 429, and how many times. Lengthening, because the limit is a rate rather than a cap.
+HISTORY_RETRY_WAITS_S = (20.0, 45.0, 90.0)
 
 # How far along the flow each step is. Used to choose between open tabs: the flow
 # leaves spent ones behind (the signup form stays on screen after the account it
@@ -424,6 +455,115 @@ _SEND_JS = r"""
   if (!b || b.disabled) return JSON.stringify({sent: false});
   b.click();
   return JSON.stringify({sent: true});
+})()
+"""
+
+
+# ── reading an account's own history ─────────────────────────────────────────
+#
+# Every signed-in ask leaves a conversation behind, and the account keeps it. That
+# makes the handset's history a second copy of everything it ever answered -- worth
+# having when the first copy is lost, and the only route back to an ask that has
+# already happened, since re-asking gets a fresh answer rather than the old one.
+#
+# Read through the same endpoints the web app uses, from a page on chatgpt.com so the
+# session cookie is already there. `/api/auth/session` hands out the bearer token the
+# app itself carries; nothing here logs in or stores a credential.
+#
+# Anonymous asks have no account and therefore no history. Neither do temporary chats
+# (`is_temporary_chat`), which are skipped rather than returned empty.
+
+# Is this tab far enough along to make the calls below? Distinguishes a page that is
+# still loading from one whose account is signed out, which otherwise both look like
+# an account with no history.
+_HISTORY_READY_JS = """
+(async () => {
+  try {
+    const r = await fetch('/api/auth/session', {credentials: 'include'});
+    if (!r.ok) return JSON.stringify({ready: false});
+    const s = await r.json();
+    return JSON.stringify({ready: !!(s && s.accessToken), signedOut: !(s && s.accessToken)});
+  } catch (e) { return JSON.stringify({ready: false}); }
+})()
+"""
+
+# One page of the conversation list, newest first. `total` in the response is
+# page-relative rather than the account's count, so paging stops on a short page.
+_HISTORY_PAGE_JS = """
+(async () => {
+  const s = await fetch('/api/auth/session', {credentials: 'include'}).then(r => r.json());
+  if (!s || !s.accessToken) return JSON.stringify({error: 'not signed in'});
+  const r = await fetch('/backend-api/conversations?offset=%d&limit=%d&order=updated',
+                        {headers: {Authorization: 'Bearer ' + s.accessToken}});
+  if (!r.ok) return JSON.stringify({error: 'list ' + r.status});
+  const j = await r.json();
+  return JSON.stringify({
+    account: (s.user && s.user.email) || '',
+    items: (j.items || []).map(c => ({id: c.id, created: c.create_time})),
+  });
+})()
+"""
+
+# A batch of conversations, each reduced to the one ask it holds. Batched because
+# every round trip crosses adb, ssh and a websocket, and a day of asks is hundreds of
+# conversations.
+_HISTORY_FETCH_JS = """
+(async () => {
+  const ids = %s;
+  const s = await fetch('/api/auth/session', {credentials: 'include'}).then(r => r.json());
+  if (!s || !s.accessToken) return JSON.stringify({error: 'not signed in'});
+  const H = {Authorization: 'Bearer ' + s.accessToken};
+  const one = async (id) => {
+    try {
+      const r = await fetch('/backend-api/conversation/' + id, {headers: H});
+      // 429 is the account saying "slower", not "no". Marked so the caller can wait
+      // and come back for it rather than dropping the conversation.
+      if (r.status === 429) return {id, error: 'get 429', retry: true};
+      if (!r.ok) return {id, error: 'get ' + r.status};
+      const c = await r.json();
+      const nodes = Object.values(c.mapping || {})
+        .filter(n => n && n.message && n.message.author && n.message.content);
+      const text = (n) => (n.message.content.parts || [])
+        .filter(x => typeof x === 'string').join('\\n').trim();
+      // The ask is the first thing the user said; the answer is the last prose the
+      // assistant produced. Everything between is tool calls and reasoning, which
+      // carry the same role but not the answer.
+      const asks = nodes.filter(n => n.message.author.role === 'user' && text(n))
+        .sort((a, b) => (a.message.create_time || 0) - (b.message.create_time || 0));
+      const said = nodes.filter(n => n.message.author.role === 'assistant'
+                                 && n.message.content.content_type === 'text' && text(n))
+        .sort((a, b) => (a.message.create_time || 0) - (b.message.create_time || 0));
+      const answer = said.length ? said[said.length - 1] : null;
+      const refs = [];
+      for (const ref of ((answer && answer.message.metadata) || {}).content_references || []) {
+        for (const item of ref.items || []) {
+          if (item && item.url) refs.push({url: item.url, title: item.title || '',
+                                           attribution: item.attribution || ''});
+        }
+      }
+      return {
+        id,
+        temporary: !!c.is_temporary_chat,
+        title: c.title || '',
+        // When the ask was made, not when the answer finished: it is the question's
+        // timestamp that a series of repeats is ordered by.
+        asked: asks.length ? asks[0].message.create_time : c.create_time,
+        prompt: asks.length ? text(asks[0]) : '',
+        answer: answer ? text(answer) : '',
+        model: (answer && answer.message.metadata
+                && answer.message.metadata.model_slug) || '',
+        references: refs,
+      };
+    } catch (e) { return {id, error: String(e)}; }
+  };
+  // One at a time, with a beat between: fetched all at once, a batch is itself
+  // enough concurrency to get the account rate limited.
+  const out = [];
+  for (const id of ids) {
+    out.push(await one(id));
+    await new Promise(r => setTimeout(r, %d));
+  }
+  return JSON.stringify({conversations: out});
 })()
 """
 
@@ -942,6 +1082,159 @@ class PhoneChatGPTScraper:
             if rank > best_rank:
                 best, best_rank = (page, state, step), rank
         return best
+
+    # -- reading the account's own history --------------------------------------
+
+    def history(self, *, since: datetime | None = None, limit: int | None = None,
+                batch: int = 4) -> list[ChatResult]:
+        """Every ask still in this handset's ChatGPT account, newest first.
+
+        A second copy of what the phone has answered, read back out of the account
+        rather than re-asked -- which is the point: re-asking a query produces a new
+        answer, where this returns the one that was actually given, with its own
+        timestamp, model and citations.
+
+        Returns the same `ChatResult` an ask returns, so a caller can put these
+        through whatever it puts live results through.
+
+        Args:
+            since: stop once conversations are older than this (UTC). The list comes
+                   back newest first, so this bounds the work rather than filtering
+                   after the fact.
+            limit: stop after this many conversations.
+            batch: conversations per round trip. Every one is an HTTP call inside the
+                   page, so this trades a longer evaluate against fewer of them.
+
+        Only what the account kept: an anonymous ask was never in an account, and a
+        temporary chat is not stored, so neither can be recovered.
+        """
+        self.session.require_open()
+        self.session.ensure_visible()
+        page = self._history_page()
+        cutoff = since.timestamp() if since else None
+        wanted: list[str] = []
+        offset, account = 0, ""
+        while limit is None or len(wanted) < limit:
+            data = self.session.evaluate(page, _HISTORY_PAGE_JS % (offset, HISTORY_PAGE))
+            if not data or data.get("error"):
+                logger.warning(f"[{self.serial}] could not list chatgpt history "
+                               f"({(data or {}).get('error', 'no response')})")
+                break
+            account = account or data.get("account", "")
+            items = data.get("items") or []
+            if not items:
+                break
+            for item in items:
+                if cutoff is not None and _epoch(item.get("created")) < cutoff:
+                    items = []          # newest first, so everything after is older too
+                    break
+                wanted.append(item["id"])
+                if limit is not None and len(wanted) >= limit:
+                    break
+            if not items or len(items) < HISTORY_PAGE:
+                break
+            offset += HISTORY_PAGE
+
+        logger.info(f"[{self.serial}] {len(wanted)} conversation(s) in {account or 'this account'}"
+                    + (f" since {since.isoformat()}" if since else ""))
+        results: list[ChatResult] = []
+        retryable: list[str] = []
+        unreadable: list[str] = []
+        for start in range(0, len(wanted), batch):
+            chunk = wanted[start:start + batch]
+            results.extend(self._fetch_batch(page, chunk, retry_into=retryable,
+                                             lost_into=unreadable))
+
+        # The account rate limits these, and a conversation refused with a 429 is one
+        # that exists and was simply asked for too fast. Dropping it would under-recover
+        # in silence -- the failure mode this whole module exists to undo -- so it is
+        # waited out and asked for again.
+        for delay in HISTORY_RETRY_WAITS_S:
+            if not retryable:
+                break
+            logger.info(f"[{self.serial}] {len(retryable)} conversation(s) were rate "
+                        f"limited; waiting {delay:.0f}s and asking again")
+            time.sleep(delay)
+            again, retryable = retryable, []
+            for start in range(0, len(again), batch):
+                results.extend(self._fetch_batch(page, again[start:start + batch],
+                                                 retry_into=retryable,
+                                                 lost_into=unreadable))
+        if retryable or unreadable:
+            logger.warning(
+                f"[{self.serial}] {len(retryable) + len(unreadable)} of {len(wanted)} "
+                f"conversation(s) could not be read, so they are NOT in what this "
+                f"returned ({len(retryable)} still rate limited)")
+        return results
+
+    def _fetch_batch(self, page: dict, ids: list[str], *, retry_into: list[str],
+                     lost_into: list[str]) -> list[ChatResult]:
+        """One round trip's worth of conversations.
+
+        A conversation that was refused goes into `retry_into` if asking again could
+        help and `lost_into` if it could not, so that neither is quietly a zero.
+        """
+        data = self.session.evaluate(
+            page, _HISTORY_FETCH_JS % (json.dumps(ids), HISTORY_FETCH_PAUSE_MS),
+            timeout=HISTORY_TIMEOUT_S)
+        if not data or data.get("error"):
+            # The whole batch, not one conversation: worth retrying as a batch.
+            logger.debug(f"[{self.serial}] batch of {len(ids)} did not come back "
+                         f"({(data or {}).get('error', 'no response')})")
+            retry_into.extend(ids)
+            return []
+        out = []
+        for conv in data.get("conversations") or []:
+            if conv.get("retry"):
+                retry_into.append(conv["id"])
+                continue
+            if conv.get("error"):
+                lost_into.append(conv["id"])
+                continue
+            result = self._history_result(conv)
+            if result is not None:
+                out.append(result)
+        return out
+
+    def _history_page(self) -> dict:
+        """A chatgpt.com tab that is actually answering, to run the history calls from.
+
+        Opened fresh and then proved, rather than taken from whatever is already on the
+        phone: the calls below run *in* the page for its session cookie, so a tab that
+        is merely present -- still loading, or left over and frozen -- fails them as a
+        transport error that reads like an empty account.
+        """
+        self.session.launch(CHATGPT_HOME_URL)
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            time.sleep(2.0)
+            page = _any_chatgpt_page(self.session.pages())
+            if page is None:
+                continue
+            ready = self.session.evaluate(page, _HISTORY_READY_JS)
+            if ready and ready.get("ready"):
+                return page
+            if ready and ready.get("signedOut"):
+                raise ChatGPTLoginError(
+                    f"{self.serial}: chatgpt is signed out, so it has no history to read")
+        raise ChatGPTLoginError(f"{self.serial}: chatgpt.com would not open to read history")
+
+    def _history_result(self, conv: dict) -> ChatResult | None:
+        """One recovered conversation as a `ChatResult`, or None if it holds no ask."""
+        # A temporary chat was never stored and an empty one holds no ask; neither is
+        # a conversation that failed to read, which `_fetch_batch` has already counted.
+        if conv.get("temporary") or not conv.get("prompt"):
+            return None
+        asked = datetime.fromtimestamp(_epoch(conv.get("asked")), tz=timezone.utc)
+        return ChatResult(
+            provider="chatgpt", prompt=conv["prompt"], response=conv.get("answer", ""),
+            served_model=conv.get("model") or None,
+            references=_parse_citations(conv.get("references") or [], []),
+            scraped_at=asked.isoformat(), surface="phone_farm", serial=self.serial,
+            # Said plainly, because a recovered row is not evidence the phone answered
+            # today -- it is evidence the account holds an answer from whenever this is.
+            note="recovered from chatgpt history",
+        )
 
     def clear_tab_backlog(self, keep: int = 1) -> int:
         """Close the ChatGPT tabs already open on this phone, returning how many."""
