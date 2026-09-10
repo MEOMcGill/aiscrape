@@ -275,6 +275,14 @@ HISTORY_PAGE = 100
 # parsed on the handset. At the 25s default every batch came back "no response".
 HISTORY_TIMEOUT_S = 180.0
 
+# Between conversation fetches, inside the page. The account rate limits them, and a
+# batch fired off at once is enough concurrency to trip it on its own.
+HISTORY_FETCH_PAUSE_MS = 400
+
+# How long to wait before asking again for conversations the account refused with a
+# 429, and how many times. Lengthening, because the limit is a rate rather than a cap.
+HISTORY_RETRY_WAITS_S = (20.0, 45.0, 90.0)
+
 # How far along the flow each step is. Used to choose between open tabs: the flow
 # leaves spent ones behind (the signup form stays on screen after the account it
 # created has landed), so the tab to act on is the one furthest along, not the one
@@ -508,6 +516,9 @@ _HISTORY_FETCH_JS = """
   const one = async (id) => {
     try {
       const r = await fetch('/backend-api/conversation/' + id, {headers: H});
+      // 429 is the account saying "slower", not "no". Marked so the caller can wait
+      // and come back for it rather than dropping the conversation.
+      if (r.status === 429) return {id, error: 'get 429', retry: true};
       if (!r.ok) return {id, error: 'get ' + r.status};
       const c = await r.json();
       const nodes = Object.values(c.mapping || {})
@@ -545,7 +556,14 @@ _HISTORY_FETCH_JS = """
       };
     } catch (e) { return {id, error: String(e)}; }
   };
-  return JSON.stringify({conversations: await Promise.all(ids.map(one))});
+  // One at a time, with a beat between: fetched all at once, a batch is itself
+  // enough concurrency to get the account rate limited.
+  const out = [];
+  for (const id of ids) {
+    out.push(await one(id));
+    await new Promise(r => setTimeout(r, %d));
+  }
+  return JSON.stringify({conversations: out});
 })()
 """
 
@@ -1120,19 +1138,63 @@ class PhoneChatGPTScraper:
         logger.info(f"[{self.serial}] {len(wanted)} conversation(s) in {account or 'this account'}"
                     + (f" since {since.isoformat()}" if since else ""))
         results: list[ChatResult] = []
+        retryable: list[str] = []
+        unreadable: list[str] = []
         for start in range(0, len(wanted), batch):
             chunk = wanted[start:start + batch]
-            data = self.session.evaluate(page, _HISTORY_FETCH_JS % json.dumps(chunk),
-                                         timeout=HISTORY_TIMEOUT_S)
-            if not data or data.get("error"):
-                logger.warning(f"[{self.serial}] history fetch failed for {len(chunk)} "
-                               f"conversation(s): {(data or {}).get('error', 'no response')}")
-                continue
-            for conv in data.get("conversations") or []:
-                result = self._history_result(conv)
-                if result is not None:
-                    results.append(result)
+            results.extend(self._fetch_batch(page, chunk, retry_into=retryable,
+                                             lost_into=unreadable))
+
+        # The account rate limits these, and a conversation refused with a 429 is one
+        # that exists and was simply asked for too fast. Dropping it would under-recover
+        # in silence -- the failure mode this whole module exists to undo -- so it is
+        # waited out and asked for again.
+        for delay in HISTORY_RETRY_WAITS_S:
+            if not retryable:
+                break
+            logger.info(f"[{self.serial}] {len(retryable)} conversation(s) were rate "
+                        f"limited; waiting {delay:.0f}s and asking again")
+            time.sleep(delay)
+            again, retryable = retryable, []
+            for start in range(0, len(again), batch):
+                results.extend(self._fetch_batch(page, again[start:start + batch],
+                                                 retry_into=retryable,
+                                                 lost_into=unreadable))
+        if retryable or unreadable:
+            logger.warning(
+                f"[{self.serial}] {len(retryable) + len(unreadable)} of {len(wanted)} "
+                f"conversation(s) could not be read, so they are NOT in what this "
+                f"returned ({len(retryable)} still rate limited)")
         return results
+
+    def _fetch_batch(self, page: dict, ids: list[str], *, retry_into: list[str],
+                     lost_into: list[str]) -> list[ChatResult]:
+        """One round trip's worth of conversations.
+
+        A conversation that was refused goes into `retry_into` if asking again could
+        help and `lost_into` if it could not, so that neither is quietly a zero.
+        """
+        data = self.session.evaluate(
+            page, _HISTORY_FETCH_JS % (json.dumps(ids), HISTORY_FETCH_PAUSE_MS),
+            timeout=HISTORY_TIMEOUT_S)
+        if not data or data.get("error"):
+            # The whole batch, not one conversation: worth retrying as a batch.
+            logger.debug(f"[{self.serial}] batch of {len(ids)} did not come back "
+                         f"({(data or {}).get('error', 'no response')})")
+            retry_into.extend(ids)
+            return []
+        out = []
+        for conv in data.get("conversations") or []:
+            if conv.get("retry"):
+                retry_into.append(conv["id"])
+                continue
+            if conv.get("error"):
+                lost_into.append(conv["id"])
+                continue
+            result = self._history_result(conv)
+            if result is not None:
+                out.append(result)
+        return out
 
     def _history_page(self) -> dict:
         """A chatgpt.com tab that is actually answering, to run the history calls from.
@@ -1159,9 +1221,8 @@ class PhoneChatGPTScraper:
 
     def _history_result(self, conv: dict) -> ChatResult | None:
         """One recovered conversation as a `ChatResult`, or None if it holds no ask."""
-        if conv.get("error"):
-            logger.debug(f"[{self.serial}] {conv.get('id')}: {conv['error']}")
-            return None
+        # A temporary chat was never stored and an empty one holds no ask; neither is
+        # a conversation that failed to read, which `_fetch_batch` has already counted.
         if conv.get("temporary") or not conv.get("prompt"):
             return None
         asked = datetime.fromtimestamp(_epoch(conv.get("asked")), tz=timezone.utc)
