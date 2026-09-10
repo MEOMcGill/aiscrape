@@ -379,7 +379,10 @@ class PhoneBackend:
                     await asyncio.to_thread(scraper.clear_tab_backlog)
                 except Exception as e:  # noqa: BLE001
                     logger.debug(f"[{self._label}] tab cleanup on {serial} failed: {e}")
-            if self._chatgpt_login:
+            # Not for a handset already out for chat: it is only being opened to
+            # serve Google now, and signing it in costs the better part of a minute
+            # for a session nothing will use.
+            if self._chatgpt_login and await self._pool.chatgpt_state(serial) is not False:
                 await self._sign_in_chatgpt(serial)
             return
 

@@ -638,25 +638,46 @@ class PhoneChromeSession:
         """"ON_UNLOCKED" / "ON_LOCKED" / "OFF", or "" if the phone did not say.
 
         Read out of `dumpsys nfc`, which reports it in one line on these Samsungs.
+        Note the "UNLOCKED" half is about the *credential*, not about whether the
+        lock screen is on display: a phone sitting on a swipe-only keyguard reports
+        ON_UNLOCKED. Use `keyguard_showing` for that.
         """
         match = re.search(r"mScreenState=(\S+)",
                           self.adb.shell(self.serial, "dumpsys nfc | grep mScreenState"))
         return match.group(1) if match else ""
 
+    def keyguard_showing(self) -> bool:
+        """Is the lock screen on display over whatever Chrome is doing?
+
+        The window manager is the only one that says. `screen_state` cannot: a
+        handset showing a swipe-only keyguard still reports ON_UNLOCKED, so a lock
+        screen reads there as an unlocked phone.
+
+        Worth its own adb call on every ask, because a keyguard is not merely a
+        thing to type past -- it *covers Chrome*, and Android freezes a covered
+        tab. A frozen tab still answers CDP with whatever it last rendered, so an
+        ask submitted behind the lock screen opens its conversation, never paints
+        the reply, and comes back as an answer that rendered empty.
+        """
+        return "mDreamingLockscreen=true" in self.adb.shell(
+            self.serial, "dumpsys window | grep -m1 mDreamingLockscreen")
+
     def unlock(self, tries: int = 3) -> bool:
         """Wake the phone and swipe past a swipe-only lock screen. True if unlocked.
 
-        Matters only where something is *typed*: CDP reaches Chrome through the lock
-        screen quite happily, so scraping never noticed, but `adb input` goes to
-        whatever is actually on the display — so on a locked phone the keystrokes
-        land on the lock screen and the form they were meant for stays empty. That
-        is what made the ChatGPT signup fail on one handset and work on another.
+        Matters to everything, not only to what is *typed*. `adb input` goes to
+        whatever is on the display, so keystrokes meant for a form land on the lock
+        screen; and the keyguard covers Chrome, so Android freezes its tabs and a
+        page that has to paint after it loads never does.
 
         Returns False for a phone locked with a PIN or pattern, which nothing here
         can answer; that needs a person, once.
         """
         for _ in range(tries):
-            if "UNLOCKED" in self.screen_state():
+            # Both halves, because neither sees the other: `screen_state` reports a
+            # keyguard as ON_UNLOCKED, and the window manager has nothing to say
+            # about a display that is merely off.
+            if not self.keyguard_showing() and "OFF" not in self.screen_state():
                 return True
             width, height = self.screen_size()
             self.adb.shell(
@@ -664,7 +685,20 @@ class PhoneChromeSession:
                 f"input keyevent KEYCODE_WAKEUP; "
                 f"input swipe {width // 2} {int(height * 0.8)} {width // 2} {int(height * 0.2)}")
             time.sleep(1.5)
-        return "UNLOCKED" in self.screen_state()
+        return not self.keyguard_showing()
+
+    def ensure_visible(self) -> None:
+        """Put Chrome back on screen if the lock screen has come back over it.
+
+        Unlocking once when a session opens is not enough: the display times out
+        during a run and the keyguard returns, and from then on every tab on that
+        handset is frozen. One adb call, so it is worth paying before each ask.
+        """
+        if not self.keyguard_showing():
+            return
+        logger.debug(f"[{self.serial}] the lock screen is over Chrome; clearing it")
+        self.unlock()
+        self.foreground_chrome()
 
     def foreground_chrome(self) -> None:
         """Put Chrome back in front of whatever is covering it.
