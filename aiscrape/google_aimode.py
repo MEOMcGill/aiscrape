@@ -107,6 +107,9 @@ class AIOverviewResult:
     scraped_at: str = ""
     # Which handset answered, when a phone did. See SearchResult.serial.
     serial: str = ""
+    # Always None: AI Mode names no model build anywhere in the page or its RPCs.
+    # Its picker offers only a tier ("Fast", or "Pro" via `arv=1`), not a version.
+    served_model: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
