@@ -187,6 +187,12 @@ python -m aiscrape.phone_chatgpt --serial R58MEXAMPLE \
     "how does photosynthesis work"
 ```
 
+A signed-in account has memory, which lets earlier asks shape later answers. Pass
+`memory=False` (`--memory off`, or `chatgpt_memory=False` to `phone_pool`) and each
+session turns it off before the first ask. `ChatResult.memory_enabled` records the
+state every answer was given under. If the setting can't be applied, the scraper
+raises `ChatGPTMemoryError`, and the pool takes that handset out of ChatGPT asks.
+
 ### Driving many phones directly
 
 `phone_pool` is what a batch runner sits on, and it is usable on its own: a shared

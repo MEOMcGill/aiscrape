@@ -47,7 +47,7 @@ import random
 import time
 
 from aiscrape.logger import logger
-from aiscrape.phone_chatgpt import PhoneChatGPTScraper
+from aiscrape.phone_chatgpt import ChatGPTMemoryError, PhoneChatGPTScraper
 from aiscrape.phone_chatgpt import DEFAULT_ANSWER_TIMEOUT_S as DEFAULT_CHAT_TIMEOUT_S
 from aiscrape.phone_chatgpt import DEFAULT_SETTLE_MS as DEFAULT_CHAT_SETTLE_MS
 from aiscrape.phone_chatgpt import DEFAULT_WARMUP_S as DEFAULT_CHAT_WARMUP_S
@@ -266,6 +266,7 @@ class PhoneBackend:
                  chat_answer_timeout_s: int = DEFAULT_CHAT_TIMEOUT_S,
                  chat_warmup_s: float = DEFAULT_CHAT_WARMUP_S,
                  chatgpt_login: bool = True,
+                 chatgpt_memory: bool | None = None,
                  signin_precheck: bool = True,
                  chatgpt_probe: bool = True,
                  rest_after_asks: int | None = DEFAULT_REST_AFTER_ASKS,
@@ -299,8 +300,10 @@ class PhoneBackend:
                                search_settle_ms=search_settle_ms, debug=debug)
         self._chat_kw = dict(settle_ms=chat_settle_ms,
                              answer_timeout_s=chat_answer_timeout_s,
-                             warmup_s=chat_warmup_s, debug=debug)
+                             warmup_s=chat_warmup_s, memory=chatgpt_memory,
+                             debug=debug)
         self._chatgpt_login = chatgpt_login
+        self._chatgpt_memory = chatgpt_memory
         self._label = label
         self._session: PhoneChromeSession | None = None
         self._scraper: PhoneFarmAIOverviewScraper | None = None
@@ -384,6 +387,9 @@ class PhoneBackend:
             # for a session nothing will use.
             if self._chatgpt_login and await self._pool.chatgpt_state(serial) is not False:
                 await self._sign_in_chatgpt(serial)
+            if self._chatgpt_memory is not None \
+                    and await self._pool.chatgpt_state(serial) is not False:
+                await self._apply_chatgpt_memory(serial)
             return
 
     async def _sign_in_chatgpt(self, serial: str) -> None:
@@ -405,6 +411,21 @@ class PhoneBackend:
         except Exception as e:  # noqa: BLE001 — never fail a run over the login
             logger.warning(f"[{self._label}] chatgpt login on {serial} failed "
                            f"({type(e).__name__}: {str(e)[:120]}); asking anonymously")
+
+    async def _apply_chatgpt_memory(self, serial: str) -> None:
+        """Set this handset's ChatGPT memory as configured, or take it out of chat.
+
+        Out for chat rather than walled: its Google asks do not care about ChatGPT's
+        memory, and asking it ChatGPT with memory in the wrong state is worse than
+        not asking it at all.
+        """
+        try:
+            await asyncio.to_thread(self._chatgpt.apply_memory)
+        except Exception as e:  # noqa: BLE001 — any failure leaves the state unknown
+            await self._pool.set_chatgpt_ok(serial, False)
+            logger.error(f"[{self._label}] {serial} is out of ChatGPT asks for this run: "
+                         f"{e if isinstance(e, ChatGPTMemoryError) else repr(e)[:160]} "
+                         f"({self._pool.chatgpt_snapshot()})")
 
     async def _close(self) -> None:
         if self._session is not None:
@@ -470,7 +491,8 @@ class PhoneBackend:
             # ask below goes to whichever one we now hold. Checking only on the way
             # in let the proactive rest hand a fresh prompt to a handset already
             # ruled out of chat, once every `rest_after_asks`.
-            if surface == "chatgpt" and self._chatgpt_probe:
+            if surface == "chatgpt" and (self._chatgpt_probe
+                                         or self._chatgpt_memory is not None):
                 await self._skip_chat_incapable()
             self._asks_on_current += 1
             try:
@@ -553,8 +575,6 @@ class PhoneBackend:
 
     async def _skip_chat_incapable(self) -> None:
         """Move off a handset already known not to hold ChatGPT conversations."""
-        if not self._chatgpt_probe:
-            return
         for _ in range(max(1, self._pool.total)):
             if self._session is None:
                 await self._open()

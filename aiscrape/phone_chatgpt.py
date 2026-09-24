@@ -36,8 +36,9 @@ set up. What changes:
     and `ChatResult.served_model` records it (e.g. "gpt-5-6"). Anonymous names no
     model anywhere in the DOM, so it stays None rather than a guess.
   * **state.** Anonymous has no memory and no custom instructions, so every ask
-    starts blank -- for an audit that is a feature, and worth remembering now that
-    the accounts are real ones that accumulate history.
+    starts blank. A signed-in account remembers, unless its memory is turned off:
+    pass `memory=False` and each session sets it before asking (`apply_memory`),
+    and every `ChatResult.memory_enabled` says which way it was.
 
 A wall that survives all this is reported as `blocked`, exactly like Google's CAPTCHA,
 so `phone_pool` rotates to the next handset and a run degrades to the phones that
@@ -568,8 +569,62 @@ _HISTORY_FETCH_JS = """
 """
 
 
+# ── the account's memory ─────────────────────────────────────────────────────
+#
+# Settings → Personalization → "Enable memory" is the `m3m` flag, and flipping it
+# takes "reference saved memories" (`sunshine`) and "reference chat history"
+# (`moonshine`) with it. Those two can no longer be written on their own (the API
+# answers IMMUTABLE_SETTING), so they are only written on an account that has no
+# `m3m` yet. Turning memory off deletes nothing: history and saved memories stay.
+_MEMORY_KEYS = ("m3m", "sunshine", "moonshine")
+
+# Read the flags, write them if `want` (true/false, or null to only read) differs,
+# and read them back. `want` is substituted in as JSON.
+_MEMORY_JS = """
+(async () => {
+  const want = %s;
+  const keys = %s;
+  let s;
+  try {
+    const r = await fetch('/api/auth/session', {credentials: 'include'});
+    if (!r.ok) return JSON.stringify({error: 'session ' + r.status});
+    s = await r.json();
+  } catch (e) { return JSON.stringify({error: 'session ' + e}); }
+  if (!s || !s.accessToken) return JSON.stringify({signedOut: true});
+  const H = {Authorization: 'Bearer ' + s.accessToken};
+  const read = async () => {
+    const r = await fetch('/backend-api/settings/user', {headers: H});
+    if (!r.ok) throw new Error('settings ' + r.status);
+    const all = (await r.json()).settings || {};
+    const out = {};
+    for (const k of keys) if (typeof all[k] === 'boolean') out[k] = all[k];
+    return out;
+  };
+  try {
+    const before = await read();
+    const on = Object.values(before).some(v => v);
+    const writes = [];
+    if (want !== null && on !== want) {
+      const targets = 'm3m' in before ? ['m3m'] : keys.filter(k => k in before);
+      for (const k of targets) {
+        const r = await fetch('/backend-api/settings/account_user_setting?feature='
+                              + k + '&value=' + want, {method: 'PATCH', headers: H});
+        writes.push({key: k, status: r.status,
+                     body: r.ok ? '' : (await r.text()).slice(0, 200)});
+      }
+    }
+    return JSON.stringify({before, writes, after: writes.length ? await read() : before});
+  } catch (e) { return JSON.stringify({error: String(e)}); }
+})()
+"""
+
+
 class ChatGPTLoginError(RuntimeError):
     """The Google sign-in flow could not be completed on this phone."""
+
+
+class ChatGPTMemoryError(RuntimeError):
+    """The account's memory setting could not be read or set as asked."""
 
 
 # Clicked once per session. Both are "get the page out of the way": without the
@@ -613,6 +668,9 @@ class PhoneChatGPTScraper:
         warmup_s:     how long chatgpt.com must be open before the first ask, so the
                       site's anti-bot check has cleared (see `prepare`). Paid once a
                       session, not per ask.
+        memory:       set the signed-in account's memory on (True) or off (False)
+                      once a session, before the first ask; None leaves it as it is
+                      and only reads it. See `apply_memory`.
 
     Use as a context manager; reuse one instance for many prompts on one phone::
 
@@ -629,6 +687,7 @@ class PhoneChatGPTScraper:
                  settle_ms: int = DEFAULT_SETTLE_MS,
                  answer_timeout_s: int = DEFAULT_ANSWER_TIMEOUT_S,
                  warmup_s: float = DEFAULT_WARMUP_S,
+                 memory: bool | None = None,
                  keep_awake: bool = True, sleep_on_exit: bool = False,
                  debug: bool = False):
         if session is None:
@@ -644,8 +703,12 @@ class PhoneChatGPTScraper:
         self.settle_ms = settle_ms
         self.answer_timeout_s = answer_timeout_s
         self.warmup_s = warmup_s
+        self.memory = memory
         self.debug = debug
         self._prepared = False
+        # The account's memory as last read this session; None until it has been.
+        self.memory_enabled: bool | None = None
+        self._memory_checked = False
         self._last_target_id = ""
         # The tab the current ask is reading. Kept whole (not just its id) because
         # pressing send needs to foreground and evaluate on it.
@@ -726,6 +789,7 @@ class PhoneChatGPTScraper:
                 prompt, scraped_at, response=answer,
                 # Only the signed-in app names its model; anonymous stays None.
                 served_model=data.get("servedModel") or None,
+                memory_enabled=self.memory_enabled if data.get("app") else False,
                 references=_parse_citations(data.get("citations", []),
                                             data.get("anchors", [])),
                 note="" if answer else "the answer turn rendered empty",
@@ -790,11 +854,75 @@ class PhoneChatGPTScraper:
             if time.monotonic() - ready_since >= self.warmup_s:
                 self._prepared = True
                 self._last_target_id = page.get("id") or ""
-                self._close_last_tab()
+                try:
+                    if not self._memory_checked:
+                        self._apply_memory_on(page)
+                finally:
+                    self._close_last_tab()
                 return
         logger.warning(f"[{self.serial}] chatgpt.com never finished loading to accept "
                        "cookies on; asking anyway (the ask may fail verification)")
         self._prepared = True
+
+    # -- the account's memory ---------------------------------------------------
+
+    def apply_memory(self) -> bool | None:
+        """Set the account's memory to `self.memory` and return the state it ends in.
+
+        Reads before writing, so an account already set as asked costs one read.
+        With `memory=None` it only reads. A signed-out phone has no setting to read,
+        so it counts as unknown.
+
+        Raises ChatGPTMemoryError when the setting cannot be read, or does not end
+        up as asked: an ask must not go out with memory in an unknown state.
+        """
+        self.session.require_open()
+        self.session.ensure_visible()
+        self.session.launch(CHATGPT_HOME_URL)
+        deadline = time.monotonic() + 60
+        page = None
+        while time.monotonic() < deadline and page is None:
+            time.sleep(2.0)
+            page = _any_chatgpt_page(self.session.pages())
+        if page is None:
+            raise ChatGPTMemoryError(f"{self.serial}: chatgpt.com would not open "
+                                     "to read the memory setting")
+        self._last_target_id = page.get("id") or ""
+        try:
+            return self._apply_memory_on(page)
+        finally:
+            self._close_last_tab()
+
+    def _apply_memory_on(self, page: dict) -> bool | None:
+        """`apply_memory` on a chatgpt.com tab that is already open."""
+        want = json.dumps(self.memory)
+        data, state = None, None
+        # Foregrounded every try: a background tab is frozen and never answers. A
+        # tab that has only just painted can also drop the first evaluate.
+        for _ in range(3):
+            self.session.activate(page)
+            data = self.session.evaluate(page, _MEMORY_JS % (want, json.dumps(_MEMORY_KEYS)),
+                                         timeout=30)
+            state = _memory_state(data)
+            if state is not None or (data or {}).get("signedOut"):
+                break
+            time.sleep(3.0)
+        if state is None or (self.memory is not None and state != self.memory):
+            msg = (f"{self.serial}: chatgpt memory is {_memory_word(state)}, "
+                   f"wanted {_memory_word(self.memory)} ({_memory_detail(data)})")
+            if self.memory is not None:
+                raise ChatGPTMemoryError(msg)
+            if not (data or {}).get("signedOut"):
+                logger.warning(f"[{self.serial}] could not read chatgpt memory setting "
+                               f"({_memory_detail(data)})")
+        elif data.get("writes"):
+            logger.info(f"[{self.serial}] chatgpt memory turned {_memory_word(state)} "
+                        f"(was {data.get('before')})")
+        else:
+            logger.debug(f"[{self.serial}] chatgpt memory is {_memory_word(state)}")
+        self.memory_enabled = state
+        self._memory_checked = True
+        return state
 
     # -- signing in -------------------------------------------------------------
 
@@ -887,6 +1015,7 @@ class PhoneChatGPTScraper:
                 for host in ("auth.openai.com", "accounts.google.com"):
                     self.session.close_tabs_matching(host, keep=0)
                 self._prepared = False   # the session is a different one now
+                self._memory_checked = False
                 return email
             # A flow that stops moving is a flow that needs a person to look at it,
             # so the same state twice running is not treated as progress.
@@ -1396,6 +1525,30 @@ def _blocked_reason(page_text: str) -> str:
     return ""
 
 
+def _memory_state(data: dict | None) -> bool | None:
+    """Whether `_MEMORY_JS` found memory on: any of its flags set. None if unread."""
+    if not data or data.get("error") or data.get("signedOut"):
+        return None
+    after = data.get("after") or {}
+    if not after:
+        return None
+    return any(after.values())
+
+
+def _memory_word(state: bool | None) -> str:
+    return {True: "on", False: "off", None: "unknown"}[state]
+
+
+def _memory_detail(data: dict | None) -> str:
+    if not data:
+        return "no response"
+    if data.get("error"):
+        return data["error"]
+    if data.get("signedOut"):
+        return "signed out"
+    return f"read {data.get('after')}, writes {data.get('writes')}"
+
+
 def _strip_chatgpt_utm(url: str) -> str:
     """Drop the `utm_source=chatgpt.com` ChatGPT stamps on every cited URL.
 
@@ -1482,22 +1635,31 @@ def main() -> None:
                     help=f"birthday for that form (default {DEFAULT_BIRTHDAY})")
     ap.add_argument("--status", action="store_true",
                     help="report whether this phone is signed in, and exit")
+    ap.add_argument("--memory", choices=("on", "off"), default=None,
+                    help="set the account's memory before asking (default: leave it)")
     args = ap.parse_args()
+    memory = None if args.memory is None else args.memory == "on"
 
     with PhoneChatGPTScraper(
             args.serial, ssh_host=args.ssh_host, adb=args.adb,
             cdp_port=args.cdp_port, settle_ms=args.settle_ms,
-            sleep_on_exit=args.sleep_on_exit, debug=args.debug) as s:
+            memory=memory, sleep_on_exit=args.sleep_on_exit, debug=args.debug) as s:
         if args.status:
             accounts = s.session.google_accounts()
+            logged_in = s.is_logged_in()
             print(json.dumps({"serial": args.serial,
-                              "logged_in": s.is_logged_in(),
+                              "logged_in": logged_in,
+                              "memory_enabled": s.apply_memory() if logged_in else False,
                               "google_accounts": accounts}, indent=2))
             return
         if args.login:
             print(json.dumps({"serial": args.serial,
                               "signed_in_as": s.log_in(email=args.email, name=args.name,
                                                        birthday=args.birthday)}, indent=2))
+        if memory is not None and not args.prompts:
+            print(json.dumps({"serial": args.serial,
+                              "memory_enabled": s.apply_memory()}, indent=2))
+            return
         prompts = args.prompts or ([] if args.login else
                                    ["what are the economic consequences of "
                                     "how does photosynthesis work"])

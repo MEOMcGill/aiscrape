@@ -78,6 +78,9 @@ class ChatResult:
     # anonymous mobile-web ChatGPT, where the DOM names no model at all.
     served_model: str | None = None
     requested_model: str | None = None
+    # Whether the account's memory could shape this answer. False for an anonymous
+    # ask (no account, so no memory); None where nobody read the setting.
+    memory_enabled: bool | None = None
     # Invalid-response signals — not real model output; the run should stop.
     rate_limited: bool = False
     l2_block: bool = False
