@@ -5,7 +5,7 @@ from datetime import date
 import pytest
 
 from aiscrape.google_aimode import _domain, _real_url
-from aiscrape.phone_chatgpt import _age_on, _local_part, _name_for_signup
+from aiscrape.phone_chatgpt import _age_on, _local_part, _memory_state, _name_for_signup
 from aiscrape.utils import PROVIDERS, get_env_bool, normalize_storage_state
 
 
@@ -69,3 +69,16 @@ def test_every_provider_has_its_own_db_file():
 
     files = {default_db_file(p) for p in PROVIDERS}
     assert len(files) == len(PROVIDERS)
+
+
+@pytest.mark.parametrize("data,expected", [
+    ({"before": {"m3m": True}, "writes": [], "after": {"m3m": True, "sunshine": True}}, True),
+    ({"after": {"m3m": False, "sunshine": False, "moonshine": False}}, False),
+    ({"after": {"m3m": False, "sunshine": True}}, True),   # any flag on counts as on
+    ({"signedOut": True}, None),
+    ({"error": "settings 500"}, None),
+    ({"after": {}}, None),
+    (None, None),
+])
+def test_memory_state(data, expected):
+    assert _memory_state(data) is expected
