@@ -5,6 +5,7 @@ from datetime import date
 import pytest
 
 from aiscrape.google_aimode import _domain, _real_url
+from aiscrape.phone_farm import PhoneFarmAIOverviewScraper, _clean_overview_text
 from aiscrape.phone_chatgpt import _age_on, _local_part, _memory_state, _name_for_signup
 from aiscrape.utils import PROVIDERS, get_env_bool, normalize_storage_state
 
@@ -82,3 +83,36 @@ def test_every_provider_has_its_own_db_file():
 ])
 def test_memory_state(data, expected):
     assert _memory_state(data) is expected
+
+
+# What AI Mode shows when it loads `udm=50` but never runs the query.
+START_SCREEN = "Maps\nShopping\nBooks\nFlights\nFinance\nHi MEO 11, what's on your mind?"
+
+
+def test_clean_overview_text_without_the_query_echo_is_empty():
+    assert _clean_overview_text(START_SCREEN, "is the economy doing well") == ""
+
+
+def test_clean_overview_text_cuts_at_the_query_echo():
+    text = "AI Mode\nAll\nis the economy doing well\nIt depends on the measure."
+    assert _clean_overview_text(text, "is the economy doing well") == "It depends on the measure."
+
+
+class _StubSession:
+    serial = "R5CY30YVNKN"
+
+    def require_open(self): pass
+    def ensure_visible(self): pass
+    def launch(self, url): pass
+    def close_tab(self, target): pass
+
+
+def test_search_reports_the_start_screen_as_a_failed_ask():
+    scraper = object.__new__(PhoneFarmAIOverviewScraper)
+    scraper.session = _StubSession()
+    scraper._await_answer = lambda prompt: {"found": True, "text": START_SCREEN,
+                                            "anchors": [], "url": ""}
+    result = scraper.search("is the economy doing well")
+    assert not result.has_overview
+    assert not result.blocked
+    assert result.note == "ai mode never answered the query"

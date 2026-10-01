@@ -937,6 +937,13 @@ class PhoneFarmAIOverviewScraper:
                         f"an answer with no sources. Re-check the citation selectors "
                         f"in _EXTRACT_JS."
                     )
+            # `_await_answer` hands back its last read on timeout, ready or not. A page
+            # that never got there is AI Mode's start screen, not an answer.
+            if not _answer_ready(data, prompt):
+                return AIOverviewResult(query=prompt, has_overview=False, blocked=False,
+                                        note="ai mode never answered the query",
+                                        surface="phone_farm", scraped_at=scraped_at,
+                                        serial=self.serial)
             return AIOverviewResult(
                 query=prompt,
                 has_overview=bool(overview_text),
@@ -1085,12 +1092,10 @@ class PhoneFarmAIOverviewScraper:
             data = self._extract_once(prompt)
             if data and data.get("found"):
                 latest = data
-                anchors = data.get("anchors", [])
                 cur = len(data.get("text", ""))
-                # ready once there is real prose past the query echo + ≥1 source,
-                # and the text length has held steady across two reads.
-                body = _clean_overview_text(data.get("text", ""), prompt)
-                if len(body) > 200 and anchors:
+                # ready once the answer meets the bar and its text length has held
+                # steady across two reads.
+                if _answer_ready(data, prompt):
                     stable = stable + 1 if cur == last_len else 0
                     last_len = cur
                     if stable >= 1:
@@ -1148,10 +1153,13 @@ def _clean_overview_text(text: str, prompt: str) -> str:
     The `#cnt` innerText leads with nav tabs + a query echo and trails with the
     "Ask anything" box / disclaimer. Cut everything up to the last echo of the
     query, then drop leading chrome lines and stop at the first trailing marker.
+    A page with no echo of the query never ran it, so it has no answer: "".
     """
+    prompt = prompt.strip()
     idx = text.rfind(prompt)
-    if idx != -1:
-        text = text[idx + len(prompt):]
+    if idx == -1:
+        return ""
+    text = text[idx + len(prompt):]
     lines = text.splitlines()
     while lines and (not lines[0].strip()
                      or lines[0].strip() in _LEADING_CHROME
@@ -1170,6 +1178,13 @@ def _clean_overview_text(text: str, prompt: str) -> str:
             break
         kept.append(ln)
     return "\n".join(kept).strip()
+
+
+def _answer_ready(data: dict, prompt: str) -> bool:
+    """Whether an extraction holds a finished answer: real prose past the query echo
+    and at least one source link."""
+    body = _clean_overview_text(data.get("text", "") or "", prompt)
+    return len(body) > 200 and bool(data.get("anchors"))
 
 
 # Hosts that are Google's own furniture rather than a search result. Matched on the
@@ -1200,9 +1215,9 @@ def _ai_mode_page(pages: list[dict], prompt: str) -> dict | None:
     belongs to is fine on a clean phone and wrong on a real one: a handset that has
     accumulated leftover AI Mode tabs answers a large share of asks with an empty.
 
-    A stale tab could not corrupt an answer (`_clean_overview_text` cuts at the echo of
-    *this* prompt and finds none in someone else's page), so the damage was empties
-    rather than wrong data. Requiring the `q` match turns "read the wrong tab and
+    A stale tab could not corrupt an answer (`_clean_overview_text` returns "" for a
+    page with no echo of *this* prompt), so the damage was empties rather than wrong
+    data. Requiring the `q` match turns "read the wrong tab and
     report nothing" into "wait for the right tab", and closing tabs after use keeps
     the list short enough that the match is found quickly.
     """
