@@ -937,16 +937,16 @@ class PhoneFarmAIOverviewScraper:
                         f"an answer with no sources. Re-check the citation selectors "
                         f"in _EXTRACT_JS."
                     )
-            # `_await_answer` hands back its last read on timeout, ready or not. A page
-            # that never got there is AI Mode's start screen, not an answer.
-            if not _answer_ready(data, prompt):
+            # Nothing past the query echo, or no echo at all: AI Mode loaded but never
+            # ran the query (its start screen). Unsourced answers still count.
+            if not overview_text:
                 return AIOverviewResult(query=prompt, has_overview=False, blocked=False,
                                         note="ai mode never answered the query",
                                         surface="phone_farm", scraped_at=scraped_at,
                                         serial=self.serial)
             return AIOverviewResult(
                 query=prompt,
-                has_overview=bool(overview_text),
+                has_overview=True,
                 overview_text=overview_text,
                 references=references,
                 container_html=data.get("html", ""),

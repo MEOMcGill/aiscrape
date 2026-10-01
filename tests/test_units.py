@@ -116,3 +116,15 @@ def test_search_reports_the_start_screen_as_a_failed_ask():
     assert not result.has_overview
     assert not result.blocked
     assert result.note == "ai mode never answered the query"
+
+
+def test_search_keeps_an_answer_with_no_sources():
+    prompt = "is the economy doing well"
+    answer = "It depends on the measure."
+    scraper = object.__new__(PhoneFarmAIOverviewScraper)
+    scraper.session = _StubSession()
+    scraper._await_answer = lambda p: {"found": True, "text": f"AI Mode\n{prompt}\n{answer}",
+                                       "anchors": [], "url": ""}
+    result = scraper.search(prompt)
+    assert result.has_overview
+    assert result.overview_text == answer
