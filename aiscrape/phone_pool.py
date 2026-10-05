@@ -550,6 +550,15 @@ class PhoneBackend:
                 continue
             if self._ask_delay[1]:
                 await asyncio.sleep(random.uniform(*self._ask_delay))
+            if result.blocked and surface == "claude":
+                # A usage cap belongs to the account, not the phone, so the handset
+                # keeps serving the other surfaces.
+                logger.warning(f"[{self._label}] {self._serial}: {result.note}; out of "
+                               f"Claude asks for this run ({self._pool.claude_snapshot()})")
+                await self._pool.set_claude_ok(self._serial, False)
+                self._dry[surface] = 0
+                await self._rest()
+                continue
             if result.blocked:
                 self._dry[surface] = 0
                 await self._rotate()   # try the same prompt on the next phone
@@ -613,7 +622,9 @@ class PhoneBackend:
         """Claude's answer to `prompt`, rotating past a usage limit or a dry streak.
 
         Each handset is checked for a claude.ai session the first time it is asked
-        Claude in a run, and signed in (creating its account) if `claude_login`.
+        Claude in a run, and signed in (creating its account) if `claude_login`. A
+        handset that hits its usage limit is out of Claude asks for the rest of the
+        run, but is not walled.
         """
         return await self._ask_rotating(
             "claude",

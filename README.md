@@ -216,8 +216,9 @@ python -m aiscrape.phone_claude --serial R58MEXAMPLE \
 setting, which is off on a new account. The scraper reads that setting but
 never changes it. In `phone_pool`, `PhoneBackend.claude(prompt)` checks each
 handset the first time it is asked Claude in a run, signs it in if
-`claude_login` (the default), and leaves a phone it can't sign in out of Claude
-asks without walling it for the other surfaces.
+`claude_login` (the default). A phone it can't sign in, or one that hits Claude's
+usage limit, is left out of Claude asks for the run without being walled, so it
+keeps serving the other surfaces.
 
 ### Driving many phones directly
 
