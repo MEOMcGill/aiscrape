@@ -127,31 +127,3 @@ def test_claude_sign_in_result_is_remembered_without_walling(ok):
     assert state is ok
     assert "0 walled" in snapshot
 
-
-class _LimitedClaude:
-    def ask(self, prompt):
-        from aiscrape.models import ChatResult
-        return ChatResult(provider="claude", prompt=prompt, blocked=True,
-                          rate_limited=True, note="claude usage limit")
-
-
-def test_a_usage_limit_takes_the_handset_out_of_claude_without_walling():
-    async def run():
-        pool = SerialPool(["S1"])
-        backend = PhoneBackend(pool, ask_delay_min_s=0, ask_delay_max_s=0)
-        backend._serial, backend._session = "S1", object()
-        backend._claude = _LimitedClaude()
-        await pool.set_claude_ok("S1", True)
-        rested = []
-
-        async def rest():
-            rested.append(backend._serial)
-            raise RuntimeError("stop after the first rest")
-        backend._rest = rest
-        with pytest.raises(RuntimeError, match="first rest"):
-            await backend.claude("anything")
-        return await pool.claude_state("S1"), pool.snapshot(), rested
-    state, snapshot, rested = asyncio.run(run())
-    assert state is False
-    assert "0 walled" in snapshot
-    assert rested == ["S1"]

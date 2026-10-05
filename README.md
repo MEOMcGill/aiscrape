@@ -216,16 +216,19 @@ python -m aiscrape.phone_claude --serial R58MEXAMPLE \
 setting, which is off on a new account. The scraper reads that setting but
 never changes it. In `phone_pool`, `PhoneBackend.claude(prompt)` checks each
 handset the first time it is asked Claude in a run, signs it in if
-`claude_login` (the default). A phone it can't sign in, or one that hits Claude's
-usage limit, is left out of Claude asks for the run without being walled, so it
-keeps serving the other surfaces.
+`claude_login` (the default). A phone it can't sign in is left out of Claude asks
+for the run, and one that hits Claude's usage limit is walled for Claude for 30
+minutes; either way it keeps serving the other surfaces.
 
 ### Driving many phones directly
 
 `phone_pool` is what a batch runner sits on, and it is usable on its own: a shared
 `SerialPool` over the farm's serials, an async `PhoneBackend` that wraps the
-synchronous phone scraper in threads, and rotation to the next handset when one
-trips a CAPTCHA (raising `PhoneFarmExhausted` when they are all walled).
+synchronous phone scraper in threads, and rotation to the next handset when a
+provider walls one. A wall is per provider and lasts `wall_cooldown_s` (30 min):
+a phone Google has CAPTCHA'd is not asked Google again until then, but keeps
+answering ChatGPT and Claude. `PhoneFarmExhausted` is raised when no free phone
+can take a provider's ask.
 
 ```python
 from aiscrape import open_phone_workers, PhoneFarmExhausted

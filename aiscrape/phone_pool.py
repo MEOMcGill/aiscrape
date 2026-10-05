@@ -12,12 +12,12 @@ what you need to drive *many* of them for a long batch:
 - **Async wrapping.** The phone scrapers are synchronous (subprocess + websocket);
   each call runs in a worker thread via `asyncio.to_thread`, so async runners keep
   their structure.
-- **Serial rotation when a phone is walled.** Like the Google account pool rotates
-  to the next account when one is walled, this rotates to the next phone serial
-  when a scrape comes back `blocked` — Google's "unusual traffic", or ChatGPT's
-  verification wall — re-trying the same prompt. When every phone is walled it
-  raises `PhoneFarmExhausted`, which callers catch to stop and save (unreached
-  prompts resume next run).
+- **Per-provider walls.** When an ask comes back `blocked` — Google's "unusual
+  traffic", ChatGPT's verification wall, Claude's usage limit — that phone is not
+  asked that provider for `wall_cooldown_s` (30 min), and the same prompt moves to
+  another phone. The walled phone keeps serving the other providers. When no free
+  phone can take a provider's ask it raises `PhoneFarmExhausted`, which callers
+  catch to wait or to stop and save (unreached prompts resume next run).
 - **A shared allocator**, so concurrent workers never drive the same handset and a
   walled phone's replacement comes from the same global pool rather than a
   per-worker slice.
@@ -47,6 +47,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
+from collections import Counter
 
 from aiscrape.logger import logger
 from aiscrape.phone_chatgpt import ChatGPTMemoryError, PhoneChatGPTScraper
@@ -86,12 +87,15 @@ CHAT_STRIKES_BEFORE_EXCLUDING = 2
 # answer would walk the farm collecting a strike on every phone.
 MAX_HANDSETS_PER_CHAT_PROMPT = 3
 
-# How long a walled handset is left alone before the farm will try it again. A
-# CAPTCHA is a property of the session and it decays; treating it as permanent is
-# what turns "one phone tripped a wall" into "this run is over" on a small farm.
-# Only reached for when nothing else is free, so a healthy farm never re-tests.
-# 0 disables revival, restoring the walled-for-the-session behaviour.
+# How long a handset is not asked a provider after that provider walled it. Walls
+# decay, and they belong to one provider's session, so the phone keeps serving the
+# others meanwhile. 0 keeps a wall for the rest of the run.
 DEFAULT_WALL_COOLDOWN_S = 30 * 60
+
+# Which provider's walls each surface shares. AI Mode and plain search are one
+# Google session, so a CAPTCHA on either stops both.
+SURFACE_PROVIDER = {"ai_mode": "google", "search": "google",
+                    "chatgpt": "chatgpt", "claude": "claude"}
 
 # Proactive rotation every 5 asks, and a jittered 5-10s between them. Against the live
 # farm (2026-08) a flat 2s gap with stay-until-walled saw the runway before a CAPTCHA
@@ -105,29 +109,30 @@ DEFAULT_ASK_DELAY_MAX_S = 10.0
 
 
 class PhoneFarmExhausted(RuntimeError):
-    """Every phone in the farm is walled (CAPTCHA), and none has cooled down yet."""
+    """No free phone can serve the provider being asked right now."""
 
 
 class SerialPool:
     """Shared allocator over the farm's serials.
 
-    A phone is *checked out* while a worker holds it, *walled* once it trips a
-    CAPTCHA, and returned to the free list when a worker closes it cleanly.
+    A phone is *checked out* while a worker holds it and returned to the free list
+    when the worker is done with it.
 
-    A wall is timed rather than permanent: once every other handset is spoken for,
-    one whose wall has aged past `wall_cooldown_s` is offered again. Walls decay,
-    and on a farm of a few phones treating them as final ends the run the first
-    time they all trip -- with the bank unfinished and no way back inside the run.
-    Revival is a last resort, so a farm with anything free rotates exactly as before.
+    Walls are per provider: a phone walled for Google is not handed out for Google
+    asks until `wall_cooldown_s` has passed, but is handed out for ChatGPT and
+    Claude as usual. A phone that will not start at all is walled whole, and is
+    only offered again once nothing else is free and its cooldown has passed.
     """
 
     def __init__(self, serials: list[str], *,
                  wall_cooldown_s: float = DEFAULT_WALL_COOLDOWN_S):
         self._free = list(serials)
         self._wall_cooldown_s = max(0.0, float(wall_cooldown_s))
-        # serial -> when it was walled, on the monotonic clock so a system clock
+        # serial -> when it was walled whole, on the monotonic clock so a system clock
         # change mid-run cannot make a wall look hours old.
         self._walled: dict[str, float] = {}
+        # (serial, provider) -> when that provider walled it.
+        self._provider_walls: dict[tuple[str, str], float] = {}
         self._in_use: set[str] = set()
         # Handsets whose Google web session has already been probed this run, so a
         # phone that rests and is picked up again is not probed over and over.
@@ -149,8 +154,38 @@ class SerialPool:
         return len(self._free) + len(self._in_use) + len(self._walled)
 
     def snapshot(self) -> str:
-        return (f"{len(self._free)} free / {len(self._in_use)} in use / "
+        text = (f"{len(self._free)} free / {len(self._in_use)} in use / "
                 f"{len(self._walled)} walled")
+        by_provider = Counter(provider for (serial, provider) in list(self._provider_walls)
+                              if self._provider_walled(serial, provider))
+        if by_provider:
+            text += "; walled for " + ", ".join(f"{p}: {n}" for p, n in sorted(by_provider.items()))
+        return text
+
+    def _provider_walled(self, serial: str, provider: str) -> bool:
+        """Whether `provider` still walls `serial`, dropping a wall that has lapsed."""
+        t = self._provider_walls.get((serial, provider))
+        if t is None:
+            return False
+        if self._wall_cooldown_s and time.monotonic() - t >= self._wall_cooldown_s:
+            del self._provider_walls[(serial, provider)]
+            return False
+        return True
+
+    def _next_clear_s(self, provider: str) -> float | None:
+        """Seconds until the soonest wall for `provider` lapses; None if they never do."""
+        if not self._wall_cooldown_s:
+            return None
+        now = time.monotonic()
+        left = [self._wall_cooldown_s - (now - t)
+                for (_, p), t in self._provider_walls.items() if p == provider]
+        return max(0.0, min(left)) if left else None
+
+    def _take_free(self, provider: str | None) -> str | None:
+        for i, serial in enumerate(self._free):
+            if provider is None or not self._provider_walled(serial, provider):
+                return self._free.pop(i)
+        return None
 
     def _revive_walled(self) -> list[str]:
         """Move handsets whose wall has aged out back to the free list.
@@ -170,9 +205,11 @@ class SerialPool:
             self._free.append(serial)
         return [serial for _, serial in due]
 
-    async def acquire(self) -> str:
+    async def acquire(self, provider: str | None = None) -> str:
+        """A free phone that `provider` has not walled (any free phone if None)."""
         async with self._lock:
-            if not self._free:
+            serial = self._take_free(provider)
+            if serial is None:
                 # Last resort: a healthy farm never gets here, so this cannot
                 # disturb the ordinary rotation.
                 revived = self._revive_walled()
@@ -181,22 +218,44 @@ class SerialPool:
                         f"[phone] wall cooldown elapsed on {', '.join(revived)}; "
                         f"trying {'them' if len(revived) > 1 else 'it'} again "
                         f"({self.snapshot()})")
-            if not self._free:
-                raise PhoneFarmExhausted(
-                    f"no phone available ({self.snapshot()}"
-                    + (f", none walled longer than {self._wall_cooldown_s:.0f}s"
-                       if self._walled and self._wall_cooldown_s else "")
-                    + ")")
-            serial = self._free.pop(0)
+                serial = self._take_free(provider)
+            if serial is None:
+                raise PhoneFarmExhausted(self._exhausted_reason(provider))
             self._in_use.add(serial)
             return serial
 
+    def _exhausted_reason(self, provider: str | None) -> str:
+        if provider and self._free:
+            clear = self._next_clear_s(provider)
+            when = (f"; the next clears in {clear / 60:.0f} min" if clear is not None
+                    else "; walls last the run")
+            return (f"no phone available for {provider}: {len(self._free)} free but "
+                    f"walled for it{when} ({self.snapshot()})")
+        return (f"no phone available ({self.snapshot()}"
+                + (f", none walled longer than {self._wall_cooldown_s:.0f}s"
+                   if self._walled and self._wall_cooldown_s else "")
+                + ")")
+
     async def wall(self, serial: str) -> None:
+        """Take a phone out entirely: for one that will not start, not for a provider wall."""
         async with self._lock:
             self._in_use.discard(serial)
             # Re-walling restarts the clock, which is what a handset that came back
             # and tripped again has earned.
             self._walled[serial] = time.monotonic()
+
+    async def wall_provider(self, serial: str, provider: str) -> None:
+        """Stop handing `serial` out for `provider` for `wall_cooldown_s`."""
+        async with self._lock:
+            self._provider_walls[(serial, provider)] = time.monotonic()
+
+    async def is_walled_for(self, serial: str, provider: str) -> bool:
+        async with self._lock:
+            return self._provider_walled(serial, provider)
+
+    @property
+    def wall_cooldown_s(self) -> float:
+        return self._wall_cooldown_s
 
     async def chatgpt_state(self, serial: str) -> bool | None:
         """False once this handset is out for chat, True once it has answered one."""
@@ -264,7 +323,7 @@ class PhoneBackend:
 
     Holds one open handset at a time; opening one sets up its wake + CDP tunnel
     (~a few seconds), so we stay on one phone rather than rotating every prompt --
-    until it is walled (`_rotate`), or until `rest_after_asks` asks have passed on
+    until a provider walls it (`_wall`), or until `rest_after_asks` asks have passed on
     it with nothing wrong at all (`_rest`), whichever comes first. Both `rest_after_asks`
     and the jittered inter-ask pace are on by default (see DEFAULT_REST_AFTER_ASKS /
     DEFAULT_ASK_DELAY_MIN_S / DEFAULT_ASK_DELAY_MAX_S) -- a caller has to opt OUT, not
@@ -357,8 +416,8 @@ class PhoneBackend:
     async def __aexit__(self, *exc) -> None:
         await self._close()
 
-    async def _open(self) -> None:
-        """Take phones from the pool until one actually starts up.
+    async def _open(self, provider: str | None = None) -> None:
+        """Take phones from the pool until one starts up and can serve `provider`.
 
         A handset can be adb-authorized yet unusable — most often Chrome runs but
         never opens `chrome_devtools_remote`, which needs Chrome's first run
@@ -366,7 +425,7 @@ class PhoneBackend:
         back, so the next worker doesn't trip over it too.
         """
         while True:
-            serial = await self._pool.acquire()   # raises PhoneFarmExhausted
+            serial = await self._pool.acquire(provider)   # raises PhoneFarmExhausted
             session = PhoneChromeSession(serial, **self._session_kw)
             try:
                 await asyncio.to_thread(session.__enter__)
@@ -383,20 +442,15 @@ class PhoneBackend:
             # Google? A signed-out phone answers in full prose and cites nothing, so
             # its rows read as successes -- worth one page load per phone per run to
             # find out up front rather than a run's worth of sourceless answers.
+            # A signed-out phone is walled for Google only; it still serves the chatbots.
             if self._signin_precheck and not await self._pool.is_verified(serial):
-                try:
-                    await asyncio.to_thread(self._scraper.assert_google_signed_in)
-                except GoogleSignedOutError as e:
-                    logger.error(f"[{self._label}] {e}")
-                    await asyncio.to_thread(session.__exit__, None, None, None)
-                    self._serial = self._session = None
-                    self._scraper = self._chatgpt = self._claude = None
-                    await self._pool.wall(serial)
-                    continue
-                except Exception as e:   # noqa: BLE001 — a probe must not cost a phone
-                    logger.warning(f"[{self._label}] sign-in probe on {serial} failed "
-                                   f"({type(e).__name__}: {str(e)[:80]}); using it anyway")
-                await self._pool.mark_verified(serial)
+                if await self._google_signed_in(serial):
+                    await self._pool.mark_verified(serial)
+                else:
+                    await self._pool.wall_provider(serial, "google")
+                    if provider == "google":
+                        await self._close()
+                        continue
             self._dry = {}
             self._asks_on_current = 0
             logger.info(f"[{self._label}] using {serial} ({self._pool.snapshot()})")
@@ -419,6 +473,19 @@ class PhoneBackend:
                     and await self._pool.chatgpt_state(serial) is not False:
                 await self._apply_chatgpt_memory(serial)
             return
+
+    async def _google_signed_in(self, serial: str) -> bool:
+        """The Google sign-in probe; a probe that fails to run counts as signed in."""
+        try:
+            await asyncio.to_thread(self._scraper.assert_google_signed_in)
+        except GoogleSignedOutError as e:
+            logger.error(f"[{self._label}] {e}; no Google asks on {serial} for "
+                         f"{self._pool.wall_cooldown_s / 60:.0f} min")
+            return False
+        except Exception as e:   # noqa: BLE001 — a probe must not cost a phone
+            logger.warning(f"[{self._label}] sign-in probe on {serial} failed "
+                           f"({type(e).__name__}: {str(e)[:80]}); using it anyway")
+        return True
 
     async def _sign_in_chatgpt(self, serial: str) -> None:
         """Make sure ChatGPT is signed in on this phone, best-effort.
@@ -464,23 +531,25 @@ class PhoneBackend:
             await self._pool.release(self._serial)
             self._serial = None
 
-    async def _rotate(self, reason: str = "CAPTCHA") -> None:
-        """Wall the current phone and take the next free one from the pool."""
-        if self._serial is not None:
-            await self._pool.wall(self._serial)
-            logger.warning(f"[{self._label}] {self._serial} walled ({reason}); "
-                           f"rotating ({self._pool.snapshot()})")
-            if self._session is not None:
-                await asyncio.to_thread(self._session.__exit__, None, None, None)
-                self._session = None
-            self._scraper = self._chatgpt = self._claude = None
-            self._serial = None
-        await self._open()   # raises PhoneFarmExhausted if none left
+    async def _wall(self, surface: str, reason: str) -> None:
+        """Wall the current phone for this surface's provider and move to another.
 
-    async def _rest(self) -> None:
+        Only that provider: the phone goes back to the pool and keeps serving the
+        others, and is handed out for this one again after `wall_cooldown_s`.
+        """
+        provider = SURFACE_PROVIDER[surface]
+        if self._serial is not None:
+            await self._pool.wall_provider(self._serial, provider)
+            logger.warning(f"[{self._label}] {self._serial} walled for {provider} ({reason}); "
+                           f"no {provider} asks on it for "
+                           f"{self._pool.wall_cooldown_s / 60:.0f} min ({self._pool.snapshot()})")
+            await self._close()
+        await self._open(provider)   # raises PhoneFarmExhausted if none is free for it
+
+    async def _rest(self, provider: str | None = None) -> None:
         """Voluntarily give up the current phone and pick up a fresh one.
 
-        Unlike `_rotate`, this does NOT wall the serial -- it has done nothing
+        Unlike `_wall`, this does NOT wall the serial -- it has done nothing
         wrong, it has just done its share for now. `_close` releases it back to
         the pool's free list (FIFO), so with more phones in the farm than
         concurrent workers this naturally round-robins the whole set: the phone
@@ -494,36 +563,59 @@ class PhoneBackend:
             logger.info(f"[{self._label}] {self._serial} resting after "
                        f"{self._asks_on_current} asks ({self._pool.snapshot()})")
             await self._close()
-        await self._open()
+        await self._open(provider)
+
+    async def _settle(self, surface: str) -> None:
+        """Hold a phone that can take this surface's next ask, moving until one can."""
+        provider = SURFACE_PROVIDER[surface]
+        if self._session is None:
+            await self._open(provider)
+        elif self._rest_after and self._asks_on_current >= self._rest_after:
+            await self._rest(provider)
+        for _ in range(max(1, self._pool.total) + 1):
+            unfit = await self._unfit_for(surface)
+            if unfit is None:
+                return
+            logger.info(f"[{self._label}] {self._serial} {unfit}; trying another handset "
+                        f"({self._pool.snapshot()})")
+            await self._rest(provider)
+        raise PhoneFarmExhausted(f"no handset in the farm can take a {surface} ask now "
+                                 f"({self._pool.snapshot()}; chatgpt: "
+                                 f"{self._pool.chatgpt_snapshot()}; claude: "
+                                 f"{self._pool.claude_snapshot()})")
+
+    async def _unfit_for(self, surface: str) -> str | None:
+        """Why the current phone cannot take this surface's ask, or None if it can."""
+        provider = SURFACE_PROVIDER[surface]
+        if await self._pool.is_walled_for(self._serial, provider):
+            return f"is walled for {provider}"
+        if surface == "chatgpt" and (self._chatgpt_probe or self._chatgpt_memory is not None) \
+                and await self._pool.chatgpt_state(self._serial) is False:
+            return "is out for chat"
+        if surface == "claude":
+            state = await self._pool.claude_state(self._serial)
+            if state is None:
+                state = await self._check_claude(self._serial)
+            if not state:
+                return "is out for Claude"
+        return None
 
     async def _ask_rotating(self, surface: str, call, answered, *, key: str = ""):
         """Run one ask, rotating handsets past a wall or a run of empty answers.
 
-        Shared by every surface because the rotation rules are about the *phone*:
-        a blocked ask means this handset is walled and the prompt should be tried on
-        the next one, and a run of empty answers is the same evidence arriving
-        quietly (see DRY_STREAK_BEFORE_ROTATE). `answered` says what counts as an
-        answer for this surface, since the result types differ.
+        Shared by every surface: a blocked ask walls this handset for the surface's
+        provider and the prompt is tried on another one, and a run of empty answers
+        is the same evidence arriving quietly (see DRY_STREAK_BEFORE_ROTATE).
+        `answered` says what counts as an answer for this surface, since the result
+        types differ.
         """
+        provider = SURFACE_PROVIDER[surface]
         retried = False
         reasked = False
         moved = 0
         while True:
-            if self._session is None:
-                await self._open()
-            elif self._rest_after and self._asks_on_current >= self._rest_after:
-                await self._rest()
-            # After the handset has been settled, not before the loop: every path
-            # back to the top of this loop can have changed phones -- the rest above,
-            # a rotate past a wall, a chat verdict moving the prompt on -- and the
-            # ask below goes to whichever one we now hold. Checking only on the way
-            # in let the proactive rest hand a fresh prompt to a handset already
-            # ruled out of chat, once every `rest_after_asks`.
-            if surface == "chatgpt" and (self._chatgpt_probe
-                                         or self._chatgpt_memory is not None):
-                await self._skip_chat_incapable()
-            if surface == "claude":
-                await self._skip_claude_signed_out()
+            # Every pass, since every path back here can have changed phones.
+            await self._settle(surface)
             self._asks_on_current += 1
             try:
                 result = await asyncio.to_thread(call)
@@ -531,7 +623,7 @@ class PhoneBackend:
                 # Its session ended mid-run; the phone still serves the other surfaces.
                 logger.error(f"[{self._label}] {e}; out of Claude asks for this run")
                 await self._pool.set_claude_ok(self._serial, False)
-                await self._rest()
+                await self._rest(provider)
                 continue
             except UnusableResultError as e:
                 # The page rendered but cannot be trusted, so it is not written
@@ -539,29 +631,21 @@ class PhoneBackend:
                 logger.error(f"[{self._label}] {e}")
                 self._dry[surface] = 0
                 if e.walls_handset:
-                    await self._rotate(reason=type(e).__name__)
+                    await self._wall(surface, type(e).__name__)
                     continue
                 if reasked:
                     # A second handset saw the same thing, so the page was honest.
                     logger.warning(f"[{self._label}] two handsets agree; storing it")
                     return e.result
                 reasked = True
-                await self._rest()   # a different phone, but this one did no wrong
+                await self._rest(provider)   # a different phone, but this one did no wrong
                 continue
             if self._ask_delay[1]:
                 await asyncio.sleep(random.uniform(*self._ask_delay))
-            if result.blocked and surface == "claude":
-                # A usage cap belongs to the account, not the phone, so the handset
-                # keeps serving the other surfaces.
-                logger.warning(f"[{self._label}] {self._serial}: {result.note}; out of "
-                               f"Claude asks for this run ({self._pool.claude_snapshot()})")
-                await self._pool.set_claude_ok(self._serial, False)
-                self._dry[surface] = 0
-                await self._rest()
-                continue
             if result.blocked:
                 self._dry[surface] = 0
-                await self._rotate()   # try the same prompt on the next phone
+                # Try the same prompt on another phone.
+                await self._wall(surface, result.note or "blocked")
                 continue
             if answered(result):
                 self._dry[surface] = 0
@@ -577,7 +661,7 @@ class PhoneBackend:
                     and await self._chat_failure_verdict(key) == "elsewhere":
                 self._dry[surface] = 0
                 moved += 1
-                await self._rest()   # not walled: it still serves Google
+                await self._rest(provider)   # not walled: it still serves Google
                 continue
             # An ask that produced nothing. One is ordinary; a run of them means this
             # handset has stopped answering, which Google does WITHOUT ever showing a
@@ -586,11 +670,10 @@ class PhoneBackend:
             self._dry[surface] = self._dry.get(surface, 0) + 1
             if self._dry[surface] < DRY_STREAK_BEFORE_ROTATE or retried:
                 return result
-            logger.warning(f"[{self._label}] {self._dry[surface]} {surface} asks in a row "
-                           f"with no answer on {self._serial}; rotating (no wall seen)")
+            streak = self._dry[surface]
             self._dry[surface] = 0
             retried = True
-            await self._rotate()
+            await self._wall(surface, f"{streak} {surface} asks in a row with no answer")
 
     async def search(self, prompt: str):
         """AI Mode answer for `prompt`, rotating past a CAPTCHA or a dry streak."""
@@ -604,12 +687,11 @@ class PhoneBackend:
         """ChatGPT's answer to `prompt`, rotating past a wall or a dry streak.
 
         Rotates on the same evidence as `search`, on the ChatGPT versions of it: the
-        verification wall and the anonymous usage cap both arrive as `blocked`. The
-        walls are independent of Google's, which is why the dry streak is counted
-        per surface -- a phone Google has stopped answering usually still chats.
+        verification wall and the anonymous usage cap both arrive as `blocked`, and
+        wall the phone for ChatGPT only. The dry streak is counted per surface for
+        the same reason -- a phone Google has stopped answering usually still chats.
 
-        Handsets already out for chat are skipped inside `_ask_rotating`, which is
-        the only place that knows which one is about to be asked.
+        Handsets already out for chat are skipped in `_settle`.
         """
         return await self._ask_rotating(
             "chatgpt",
@@ -623,30 +705,13 @@ class PhoneBackend:
 
         Each handset is checked for a claude.ai session the first time it is asked
         Claude in a run, and signed in (creating its account) if `claude_login`. A
-        handset that hits its usage limit is out of Claude asks for the rest of the
-        run, but is not walled.
+        usage limit walls the phone for Claude only.
         """
         return await self._ask_rotating(
             "claude",
             lambda: self._claude.ask(prompt),
             lambda r: bool(r.response),
         )
-
-    async def _skip_claude_signed_out(self) -> None:
-        """Settle on a handset signed in to Claude, signing phones in as they come up."""
-        for _ in range(max(1, self._pool.total)):
-            if self._session is None:
-                await self._open()
-            state = await self._pool.claude_state(self._serial)
-            if state is None:
-                state = await self._check_claude(self._serial)
-            if state:
-                return
-            logger.info(f"[{self._label}] {self._serial} is out for Claude "
-                        f"({self._pool.claude_snapshot()}); trying another handset")
-            await self._rest()
-        raise PhoneFarmExhausted(
-            f"no handset in the farm is signed in to Claude ({self._pool.claude_snapshot()})")
 
     async def _check_claude(self, serial: str) -> bool:
         """Whether this handset can ask Claude, signing it in first if allowed."""
@@ -661,20 +726,6 @@ class PhoneBackend:
             ok = False
         await self._pool.set_claude_ok(serial, ok)
         return ok
-
-    async def _skip_chat_incapable(self) -> None:
-        """Move off a handset already known not to hold ChatGPT conversations."""
-        for _ in range(max(1, self._pool.total)):
-            if self._session is None:
-                await self._open()
-            if await self._pool.chatgpt_state(self._serial) is not False:
-                return
-            logger.info(f"[{self._label}] {self._serial} is out for chat "
-                        f"({self._pool.chatgpt_snapshot()}); trying another handset")
-            await self._rest()
-        raise PhoneFarmExhausted(
-            f"no handset in the farm can hold a ChatGPT conversation "
-            f"({self._pool.chatgpt_snapshot()})")
 
     async def _chat_failure_verdict(self, prompt: str) -> str:
         """What to do about a ChatGPT ask that came back empty: store it, or re-ask.
@@ -703,9 +754,10 @@ class PhoneBackend:
         """Google's normal top results for `prompt`, rotating phones past any CAPTCHA.
 
         Rotates like `search` rather than returning the blocked result: a wall is a
-        property of the phone, not of the query, and the two surfaces share one
-        handset -- so a caller collecting both would otherwise get an answer for AI
-        Mode and a silent blank for the web results off the same walled phone.
+        property of the phone's Google session, not of the query, and the two
+        surfaces share it -- so a caller collecting both would otherwise get an
+        answer for AI Mode and a silent blank for the web results off the same
+        walled phone.
 
         No dry-streak rotation, unlike `search`: `search_normal` cannot come back
         empty any more. A page that ranks nothing is raised as an
