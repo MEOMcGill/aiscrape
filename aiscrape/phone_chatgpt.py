@@ -84,7 +84,7 @@ from datetime import date, datetime, timezone
 from urllib.parse import parse_qsl, quote_plus, urlencode, urlsplit, urlunsplit
 
 from .chatbots import RATE_LIMIT_TEXT_RE
-from .google_aimode import Reference, _clean_title, _domain, _real_url
+from .google_aimode import DEBUG_DIR, Reference, _clean_title, _domain, _real_url
 from .logger import logger
 from .models import ChatResult, now_iso
 from .phone_farm import DEFAULT_CDP_PORT, PhoneChromeSession
@@ -212,6 +212,24 @@ _CHAT_EXTRACT_JS = r"""
       } catch (e) { /* not JSON this build; the anchors fallback still applies */ }
     }
   }
+  // Clickable things in the answer that are neither a link nor a payload chip. A
+  // build that cites some other way shows up here instead of as an answer with
+  // no sources.
+  const chips = body ? [...body.querySelectorAll('button, [role="button"]')]
+    .filter(el => !el.closest('a[href], pre, [data-assistant-sources-payload]')
+                  && !el.querySelector('[data-assistant-sources-payload]'))
+    .map(el => (el.innerText || el.getAttribute('aria-label') || '').trim())
+    .filter(t => t && t.length <= 80) : [];
+  // The slug is on the turn in the builds seen so far; ancestors and descendants
+  // are checked in case a build moves it.
+  const slugEl = last ? (last.closest('[data-message-model-slug]')
+                         || last.querySelector('[data-message-model-slug]')) : null;
+  // The turn's data attributes and its ancestors', for when the slug is not found.
+  const turnAttrs = [];
+  for (let el = last, i = 0; el && el.getAttributeNames && i < 4; el = el.parentElement, i++) {
+    turnAttrs.push(Object.fromEntries(el.getAttributeNames()
+      .filter(n => n.startsWith('data-')).map(n => [n, el.getAttribute(n).slice(0, 200)])));
+  }
   // While a turn streams the composer's send control becomes a stop control. Its
   // presence is a positive "still generating", so a slow first token is not read
   // as a finished empty answer.
@@ -228,7 +246,7 @@ _CHAT_EXTRACT_JS = r"""
     // `?q=` but does NOT send it, so this is how an ask finds its own pending tab.
     composerText,
     // Which model served the last turn. Only the logged-in app says.
-    servedModel: last ? (last.getAttribute('data-message-model-slug') || '') : '',
+    servedModel: slugEl ? (slugEl.getAttribute('data-message-model-slug') || '') : '',
     nUser: users.length,
     nAssistant: bots.length,
     streaming,
@@ -236,6 +254,8 @@ _CHAT_EXTRACT_JS = r"""
     html: body ? (body.innerHTML || '').slice(0, 200000) : '',
     anchors,
     citations,
+    chips,
+    turnAttrs,
     // For the block checks: a verification wall replaces the answer rather than
     // rendering inside it, so it is only visible on the page as a whole.
     bodyText: (document.body.innerText || '').slice(0, 3000),
@@ -785,14 +805,20 @@ class PhoneChatGPTScraper:
                 # error message, not the model's output.
                 return self._result(prompt, scraped_at,
                                     note="chatgpt failed to generate a response")
+            references = _parse_citations(data.get("citations", []),
+                                          data.get("anchors", []))
+            gaps = _extraction_gaps(data, references) if answer else []
+            if gaps:
+                # The answer is kept: its text is complete, and `history` can
+                # restore the model and sources from the account afterwards.
+                self._snapshot(prompt, data, gaps)
             return self._result(
                 prompt, scraped_at, response=answer,
                 # Only the signed-in app names its model; anonymous stays None.
                 served_model=data.get("servedModel") or None,
                 memory_enabled=self.memory_enabled if data.get("app") else False,
-                references=_parse_citations(data.get("citations", []),
-                                            data.get("anchors", [])),
-                note="" if answer else "the answer turn rendered empty",
+                references=references,
+                note="; ".join(gaps) if answer else "the answer turn rendered empty",
             )
         finally:
             # One tab per ask, closed on the way out however we leave -- Chrome keeps
@@ -1379,6 +1405,21 @@ class PhoneChatGPTScraper:
         return ChatResult(provider="chatgpt", prompt=prompt, scraped_at=scraped_at,
                           surface="phone_farm", serial=self.serial, **kw)
 
+    def _snapshot(self, prompt: str, data: dict, gaps: list[str]) -> None:
+        """Log an answer the extractor could not fully read, and keep its DOM."""
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        path = DEBUG_DIR / f"chatgpt-{self.serial}-{stamp}.json"
+        try:
+            DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"serial": self.serial, "prompt": prompt,
+                                        "gaps": gaps, **data}, ensure_ascii=False),
+                            encoding="utf-8")
+        except OSError as e:
+            path = f"nowhere: {e}"
+        shell = "app" if data.get("app") else "mobile"
+        logger.warning(f"[{self.serial}] chatgpt {shell} shell: {'; '.join(gaps)} "
+                       f"(page kept at {path})")
+
     def _close_last_tab(self) -> None:
         target, self._last_target_id = self._last_target_id, ""
         self.session.close_tab(target)
@@ -1523,6 +1564,17 @@ def _blocked_reason(page_text: str) -> str:
     if any(m in low for m in _ANON_LIMIT_TEXT):
         return "chatgpt anonymous usage limit"
     return ""
+
+
+def _extraction_gaps(data: dict, references: list[Reference]) -> list[str]:
+    """What an answered page showed that the extractor failed to read, as notes."""
+    gaps = []
+    # Anonymous never names a model, so only the signed-in app's absence counts.
+    if data.get("app") and not data.get("servedModel"):
+        gaps.append("signed-in turn carried no model slug")
+    if not references and data.get("chips"):
+        gaps.append("answer shows source chips the extractor could not read")
+    return gaps
 
 
 def _memory_state(data: dict | None) -> bool | None:

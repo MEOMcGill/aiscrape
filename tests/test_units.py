@@ -6,7 +6,9 @@ import pytest
 
 from aiscrape.google_aimode import _domain, _real_url
 from aiscrape.phone_farm import PhoneFarmAIOverviewScraper, _clean_overview_text
-from aiscrape.phone_chatgpt import _age_on, _local_part, _memory_state, _name_for_signup
+from aiscrape import phone_chatgpt
+from aiscrape.phone_chatgpt import (PhoneChatGPTScraper, _age_on, _extraction_gaps,
+                                    _local_part, _memory_state, _name_for_signup)
 from aiscrape.utils import PROVIDERS, get_env_bool, normalize_storage_state
 
 
@@ -128,3 +130,51 @@ def test_search_keeps_an_answer_with_no_sources():
     result = scraper.search(prompt)
     assert result.has_overview
     assert result.overview_text == answer
+
+
+@pytest.mark.parametrize("data,refs,expected", [
+    ({"app": True, "servedModel": "gpt-5-6", "chips": []}, [], []),
+    ({"app": False, "servedModel": "", "chips": []}, [], []),
+    ({"app": True, "servedModel": "", "chips": []}, [],
+     ["signed-in turn carried no model slug"]),
+    ({"app": False, "servedModel": "", "chips": ["Elections Alberta"]}, [],
+     ["answer shows source chips the extractor could not read"]),
+    ({"app": False, "servedModel": "", "chips": ["Elections Alberta"]}, ["a ref"], []),
+])
+def test_extraction_gaps(data, refs, expected):
+    assert _extraction_gaps(data, refs) == expected
+
+
+def _chatgpt_scraper(data):
+    scraper = object.__new__(PhoneChatGPTScraper)
+    scraper.session = _StubSession()
+    scraper._prepared = True
+    scraper.memory_enabled = None
+    scraper._last_target_id = ""
+    scraper.prepare = lambda force=False: None
+    scraper._await_answer = lambda prompt: data
+    return scraper
+
+
+def test_ask_keeps_an_unlabelled_answer_and_flags_it(tmp_path, monkeypatch):
+    monkeypatch.setattr(phone_chatgpt, "DEBUG_DIR", tmp_path)
+    data = {"found": True, "app": True, "servedModel": "", "text": "Polls close at 8.",
+            "citations": [], "anchors": [], "chips": ["Elections Alberta"],
+            "bodyText": "Polls close at 8."}
+    result = _chatgpt_scraper(data).ask("when do polls close")
+    assert result.response == "Polls close at 8."
+    assert result.served_model is None
+    assert "no model slug" in result.note
+    assert "source chips" in result.note
+    snapshots = list(tmp_path.glob("chatgpt-*.json"))
+    assert len(snapshots) == 1
+
+
+def test_ask_leaves_a_clean_answer_unflagged(tmp_path, monkeypatch):
+    monkeypatch.setattr(phone_chatgpt, "DEBUG_DIR", tmp_path)
+    data = {"found": True, "app": True, "servedModel": "gpt-5-6", "text": "Hello.",
+            "citations": [], "anchors": [], "chips": [], "bodyText": "Hello."}
+    result = _chatgpt_scraper(data).ask("say hello")
+    assert result.served_model == "gpt-5-6"
+    assert result.note == ""
+    assert not list(tmp_path.iterdir())
