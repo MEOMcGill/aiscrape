@@ -126,3 +126,4 @@ def test_claude_sign_in_result_is_remembered_without_walling(ok):
     state, snapshot = asyncio.run(run())
     assert state is ok
     assert "0 walled" in snapshot
+
