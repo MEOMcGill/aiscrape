@@ -62,6 +62,7 @@ from aiscrape.google_aimode import (
     scrape_ai_overview_async,
 )
 from aiscrape.phone_chatgpt import PhoneChatGPTScraper
+from aiscrape.phone_claude import ClaudeLoginError, ClaudeSignedOutError, PhoneClaudeScraper
 from aiscrape.phone_farm import (
     PhoneChromeSession,
     PhoneFarmAIOverviewScraper,
@@ -85,10 +86,13 @@ __all__ = [
     "SearchResult",
     "scrape_ai_overview",
     "scrape_ai_overview_async",
-    # phone farm (Google AI Mode + ChatGPT via a real Android phone over adb + CDP)
+    # phone farm (Google AI Mode, ChatGPT and Claude via a real Android phone over adb + CDP)
     "PhoneChromeSession",
     "PhoneFarmAIOverviewScraper",
     "PhoneChatGPTScraper",
+    "PhoneClaudeScraper",
+    "ClaudeLoginError",
+    "ClaudeSignedOutError",
     "PhoneFarmError",
     "list_serials",
     # phone farm pooling / CAPTCHA rotation across many handsets

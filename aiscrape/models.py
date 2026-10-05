@@ -65,7 +65,8 @@ class ChatResult:
     """Result of one chatbot turn (ChatGPT / Claude / Gemini / Meta).
 
     One shape for every way a chatbot can be driven — the desktop camoufox
-    scrapers in `chatbots` and the phone-farm one in `phone_chatgpt` — so a caller
+    scrapers in `chatbots` and the phone-farm ones in `phone_chatgpt` and
+    `phone_claude` — so a caller
     that has a prompt and wants an answer does not care which produced it. The
     fields after `note` are the ones only a scrape *from a handset* fills in.
     """
@@ -73,8 +74,9 @@ class ChatResult:
     provider: str
     prompt: str
     response: str = ""
-    # The model the UI actually served (chatgpt/gemini), or the requested model
-    # (claude, which has a working picker); None if not applicable — which includes
+    # The model the UI actually served (chatgpt/gemini, and claude on the phone
+    # farm), or the requested model (desktop claude, which has a working picker);
+    # None if not applicable — which includes
     # anonymous mobile-web ChatGPT, where the DOM names no model at all.
     served_model: str | None = None
     requested_model: str | None = None

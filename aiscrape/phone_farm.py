@@ -781,6 +781,28 @@ class PhoneChromeSession:
                 logger.debug(f"[{self.serial}] key events failed: {e}")
             return False
 
+    def ui_bounds(self, pattern: str) -> tuple[int, int] | None:
+        """Centre of the first on-screen view whose uiautomator XML matches `pattern`.
+
+        For Chrome's own UI rather than the page's -- the native Google sign-in sheet
+        is drawn by the browser, so CDP cannot see or click it. `pattern` is a regex
+        over one `<node ...>` tag, e.g. `resource-id="com.android.chrome:id/foo"`.
+        """
+        xml = self.adb.shell(self.serial,
+                             "uiautomator dump /sdcard/ui.xml >/dev/null; cat /sdcard/ui.xml")
+        for node in re.findall(r"<node [^>]*>", xml):
+            if not re.search(pattern, node):
+                continue
+            box = re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', node)
+            if box:
+                x1, y1, x2, y2 = map(int, box.groups())
+                return (x1 + x2) // 2, (y1 + y2) // 2
+        return None
+
+    def tap(self, x: int, y: int) -> None:
+        """A real touch at screen pixels: for UI that ignores a click sent from JS."""
+        self.adb.shell(self.serial, f"input tap {x} {y}")
+
     def google_accounts(self) -> list[str]:
         """The Google accounts signed in on this phone, from `adb dumpsys account`.
 
