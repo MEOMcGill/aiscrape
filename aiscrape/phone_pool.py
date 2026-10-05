@@ -1,12 +1,14 @@
 """Async pooling and CAPTCHA rotation over a farm of Android phones.
 
 The surface scrapers (`phone_farm.PhoneFarmAIOverviewScraper` for Google AI Mode
-and plain search, `phone_chatgpt.PhoneChatGPTScraper` for ChatGPT) each drive one
-handset. This adds what you need to drive *many* of them for a long batch:
+and plain search, `phone_chatgpt.PhoneChatGPTScraper` for ChatGPT,
+`phone_claude.PhoneClaudeScraper` for Claude) each drive one handset. This adds
+what you need to drive *many* of them for a long batch:
 
 - **Every surface off one phone.** A `PhoneBackend` opens one Chrome session per
-  handset and runs all three scrapers over it (`search`, `search_normal`, `chat`),
-  because the CDP tunnel binds a port that a second session would collide with.
+  handset and runs every scraper over it (`search`, `search_normal`, `chat`,
+  `claude`), because the CDP tunnel binds a port that a second session would
+  collide with.
 - **Async wrapping.** The phone scrapers are synchronous (subprocess + websocket);
   each call runs in a worker thread via `asyncio.to_thread`, so async runners keep
   their structure.
@@ -51,6 +53,8 @@ from aiscrape.phone_chatgpt import ChatGPTMemoryError, PhoneChatGPTScraper
 from aiscrape.phone_chatgpt import DEFAULT_ANSWER_TIMEOUT_S as DEFAULT_CHAT_TIMEOUT_S
 from aiscrape.phone_chatgpt import DEFAULT_SETTLE_MS as DEFAULT_CHAT_SETTLE_MS
 from aiscrape.phone_chatgpt import DEFAULT_WARMUP_S as DEFAULT_CHAT_WARMUP_S
+from aiscrape.phone_claude import ClaudeSignedOutError, PhoneClaudeScraper
+from aiscrape.phone_claude import DEFAULT_ANSWER_TIMEOUT_S as DEFAULT_CLAUDE_TIMEOUT_S
 from aiscrape.phone_farm import (
     DEFAULT_SEARCH_SETTLE_MS,
     PhoneChromeSession,
@@ -135,6 +139,9 @@ class SerialPool:
         # Distinct prompts that have come back empty on a handset that has never
         # answered one, keyed by serial.
         self._chat_strikes: dict[str, set[str]] = {}
+        # Whether a handset is signed in to Claude: True once it has been, False once
+        # it could not be. Kept apart from walling for the same reason as ChatGPT's.
+        self._claude_ok: dict[str, bool] = {}
         self._lock = asyncio.Lock()
 
     @property
@@ -222,6 +229,20 @@ class SerialPool:
         bad = sum(1 for v in self._chatgpt_ok.values() if not v)
         return f"{ok} can chat / {bad} cannot / {self.total - ok - bad} unproven"
 
+    async def claude_state(self, serial: str) -> bool | None:
+        """False once this handset is out for Claude, True once it is signed in."""
+        async with self._lock:
+            return self._claude_ok.get(serial)
+
+    async def set_claude_ok(self, serial: str, ok: bool) -> None:
+        async with self._lock:
+            self._claude_ok[serial] = ok
+
+    def claude_snapshot(self) -> str:
+        ok = sum(1 for v in self._claude_ok.values() if v)
+        bad = sum(1 for v in self._claude_ok.values() if not v)
+        return f"{ok} signed in to claude / {bad} cannot / {self.total - ok - bad} unchecked"
+
     async def mark_verified(self, serial: str) -> None:
         """Note that this handset passed its sign-in probe for the rest of the run."""
         async with self._lock:
@@ -251,10 +272,10 @@ class PhoneBackend:
     place asks are paced; runners do not add a sleep of their own on top.
 
     A phone is one `PhoneChromeSession` with every surface scraper sharing it —
-    Google (`search`, `search_normal`) and ChatGPT (`chat`). Sharing is not an
-    optimisation: the tunnel binds a TCP port on this machine and an `adb forward`
-    on the farm host, so a second session for the same handset would collide with
-    the first on both.
+    Google (`search`, `search_normal`), ChatGPT (`chat`) and Claude (`claude`).
+    Sharing is not an optimisation: the tunnel binds a TCP port on this machine
+    and an `adb forward` on the farm host, so a second session for the same
+    handset would collide with the first on both.
     """
 
     def __init__(self, pool: SerialPool, *, ssh_host: str | None = None,
@@ -266,6 +287,8 @@ class PhoneBackend:
                  chat_answer_timeout_s: int = DEFAULT_CHAT_TIMEOUT_S,
                  chat_warmup_s: float = DEFAULT_CHAT_WARMUP_S,
                  chatgpt_login: bool = True,
+                 claude_login: bool = True,
+                 claude_answer_timeout_s: int = DEFAULT_CLAUDE_TIMEOUT_S,
                  chatgpt_memory: bool | None = None,
                  signin_precheck: bool = True,
                  chatgpt_probe: bool = True,
@@ -304,10 +327,14 @@ class PhoneBackend:
                              debug=debug)
         self._chatgpt_login = chatgpt_login
         self._chatgpt_memory = chatgpt_memory
+        self._claude_kw = dict(settle_ms=chat_settle_ms,
+                               answer_timeout_s=claude_answer_timeout_s, debug=debug)
+        self._claude_login = claude_login
         self._label = label
         self._session: PhoneChromeSession | None = None
         self._scraper: PhoneFarmAIOverviewScraper | None = None
         self._chatgpt: PhoneChatGPTScraper | None = None
+        self._claude: PhoneClaudeScraper | None = None
         self._serial: str | None = None
         # Consecutive asks on the current phone that produced no answer, per surface.
         # Kept apart because the surfaces wall independently: Google going quiet says
@@ -351,6 +378,7 @@ class PhoneBackend:
             self._serial, self._session = serial, session
             self._scraper = PhoneFarmAIOverviewScraper(session=session, **self._google_kw)
             self._chatgpt = PhoneChatGPTScraper(session=session, **self._chat_kw)
+            self._claude = PhoneClaudeScraper(session=session, **self._claude_kw)
             # Before this handset serves anything: is Chrome still signed in to
             # Google? A signed-out phone answers in full prose and cites nothing, so
             # its rows read as successes -- worth one page load per phone per run to
@@ -362,7 +390,7 @@ class PhoneBackend:
                     logger.error(f"[{self._label}] {e}")
                     await asyncio.to_thread(session.__exit__, None, None, None)
                     self._serial = self._session = None
-                    self._scraper = self._chatgpt = None
+                    self._scraper = self._chatgpt = self._claude = None
                     await self._pool.wall(serial)
                     continue
                 except Exception as e:   # noqa: BLE001 — a probe must not cost a phone
@@ -377,7 +405,7 @@ class PhoneBackend:
             # hundreds, and a long tab list is exactly what makes the right tab hard
             # to find -- doubly so for ChatGPT, whose tab choice costs a CDP call per
             # open tab. Best-effort: a phone that will not close tabs still scrapes.
-            for scraper in (self._scraper, self._chatgpt):
+            for scraper in (self._scraper, self._chatgpt, self._claude):
                 try:
                     await asyncio.to_thread(scraper.clear_tab_backlog)
                 except Exception as e:  # noqa: BLE001
@@ -431,7 +459,7 @@ class PhoneBackend:
         if self._session is not None:
             await asyncio.to_thread(self._session.__exit__, None, None, None)
             self._session = None
-        self._scraper = self._chatgpt = None
+        self._scraper = self._chatgpt = self._claude = None
         if self._serial is not None:
             await self._pool.release(self._serial)
             self._serial = None
@@ -445,7 +473,7 @@ class PhoneBackend:
             if self._session is not None:
                 await asyncio.to_thread(self._session.__exit__, None, None, None)
                 self._session = None
-            self._scraper = self._chatgpt = None
+            self._scraper = self._chatgpt = self._claude = None
             self._serial = None
         await self._open()   # raises PhoneFarmExhausted if none left
 
@@ -494,9 +522,17 @@ class PhoneBackend:
             if surface == "chatgpt" and (self._chatgpt_probe
                                          or self._chatgpt_memory is not None):
                 await self._skip_chat_incapable()
+            if surface == "claude":
+                await self._skip_claude_signed_out()
             self._asks_on_current += 1
             try:
                 result = await asyncio.to_thread(call)
+            except ClaudeSignedOutError as e:
+                # Its session ended mid-run; the phone still serves the other surfaces.
+                logger.error(f"[{self._label}] {e}; out of Claude asks for this run")
+                await self._pool.set_claude_ok(self._serial, False)
+                await self._rest()
+                continue
             except UnusableResultError as e:
                 # The page rendered but cannot be trusted, so it is not written
                 # down. Whether the handset is to blame decides what happens next.
@@ -572,6 +608,48 @@ class PhoneBackend:
             lambda r: bool(r.response),
             key=prompt,
         )
+
+    async def claude(self, prompt: str):
+        """Claude's answer to `prompt`, rotating past a usage limit or a dry streak.
+
+        Each handset is checked for a claude.ai session the first time it is asked
+        Claude in a run, and signed in (creating its account) if `claude_login`.
+        """
+        return await self._ask_rotating(
+            "claude",
+            lambda: self._claude.ask(prompt),
+            lambda r: bool(r.response),
+        )
+
+    async def _skip_claude_signed_out(self) -> None:
+        """Settle on a handset signed in to Claude, signing phones in as they come up."""
+        for _ in range(max(1, self._pool.total)):
+            if self._session is None:
+                await self._open()
+            state = await self._pool.claude_state(self._serial)
+            if state is None:
+                state = await self._check_claude(self._serial)
+            if state:
+                return
+            logger.info(f"[{self._label}] {self._serial} is out for Claude "
+                        f"({self._pool.claude_snapshot()}); trying another handset")
+            await self._rest()
+        raise PhoneFarmExhausted(
+            f"no handset in the farm is signed in to Claude ({self._pool.claude_snapshot()})")
+
+    async def _check_claude(self, serial: str) -> bool:
+        """Whether this handset can ask Claude, signing it in first if allowed."""
+        try:
+            if self._claude_login:
+                ok = await asyncio.to_thread(self._claude.ensure_logged_in)
+            else:
+                ok = await asyncio.to_thread(self._claude.is_logged_in)
+        except Exception as e:  # noqa: BLE001 — any failure leaves it unusable for Claude
+            logger.warning(f"[{self._label}] claude sign-in on {serial} failed "
+                           f"({type(e).__name__}: {str(e)[:120]})")
+            ok = False
+        await self._pool.set_claude_ok(serial, ok)
+        return ok
 
     async def _skip_chat_incapable(self) -> None:
         """Move off a handset already known not to hold ChatGPT conversations."""

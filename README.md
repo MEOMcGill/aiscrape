@@ -12,10 +12,10 @@ Two scrapers:
   response; helpers navigate to a fresh chat, pick a model where the UI allows,
   read back the served model, and detect safety blocks / rate limits.
 
-…and the same two products again on **real Android phones** over adb + the Chrome
+…and Google, ChatGPT and Claude on **real Android phones** over adb + the Chrome
 DevTools Protocol, which is how a long-running collection is realistically kept
 alive: `aiscrape.phone_farm` (Google AI Mode + plain search) and
-`aiscrape.phone_chatgpt` (ChatGPT). See [Phone farm](#phone-farm-ai-mode-via-a-real-android-phone).
+`aiscrape.phone_chatgpt` (ChatGPT) and `aiscrape.phone_claude` (Claude). See [Phone farm](#phone-farm-ai-mode-via-a-real-android-phone).
 
 Shared plumbing:
 
@@ -192,6 +192,32 @@ A signed-in account has memory, which lets earlier asks shape later answers. Pas
 session turns it off before the first ask. `ChatResult.memory_enabled` records the
 state every answer was given under. If the setting can't be applied, the scraper
 raises `ChatGPTMemoryError`, and the pool takes that handset out of ChatGPT asks.
+
+### Claude on the same phones
+
+`PhoneClaudeScraper` (`aiscrape.phone_claude`) asks **claude.ai** in that same
+Chrome and returns a `ChatResult`. The answer, the served model (e.g.
+`claude-sonnet-5-5`) and every cited source come from the conversation JSON the
+web app loads, not from the page, which folds extra sources behind "+N".
+
+claude.ai has no anonymous mode, so each phone needs an account. `log_in`
+(`--login`) signs in with the handset's own Google account. If that account has
+no Claude account yet, it creates one on the free plan: it accepts the Consumer
+Terms and Privacy Policy, declines promotional email, and opts out of "Help
+improve our AI models" (`allow_training=False`).
+
+```bash
+python -m aiscrape.phone_claude --serial R58MEXAMPLE \
+    --ssh-host phone-farm --adb 'C:\platform-tools\adb.exe' \
+    --login "how does photosynthesis work"
+```
+
+`ChatResult.memory_enabled` reports the account's "Generate memory from chats"
+setting, which is off on a new account. The scraper reads that setting but
+never changes it. In `phone_pool`, `PhoneBackend.claude(prompt)` checks each
+handset the first time it is asked Claude in a run, signs it in if
+`claude_login` (the default), and leaves a phone it can't sign in out of Claude
+asks without walling it for the other surfaces.
 
 ### Driving many phones directly
 
