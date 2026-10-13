@@ -7,7 +7,8 @@ import pytest
 from aiscrape.google_aimode import _domain, _real_url
 from aiscrape.phone_farm import PhoneFarmAIOverviewScraper, _clean_overview_text
 from aiscrape import phone_chatgpt
-from aiscrape.phone_chatgpt import (PhoneChatGPTScraper, _age_on, _extraction_gaps,
+from aiscrape.phone_chatgpt import (PhoneChatGPTScraper, _age_on, _conversation_citations,
+                                    _extraction_gaps, _strip_dil,
                                     _local_part, _memory_state, _name_for_signup)
 from aiscrape.utils import PROVIDERS, get_env_bool, normalize_storage_state
 
@@ -178,3 +179,80 @@ def test_ask_leaves_a_clean_answer_unflagged(tmp_path, monkeypatch):
     assert result.served_model == "gpt-5-6"
     assert result.note == ""
     assert not list(tmp_path.iterdir())
+
+
+DIL_ANSWER = (
+    '**<Entity value="Jane Roe" category="politician" disambig="a mayor"/>** is a mayor. '
+    '<Cite refs={["turn12search2","turn12search0"]}/>\n\n'
+    '<row gap={4}>\n  <AsyncImage query="Jane Roe portrait"/>\n  <box flex="1">\n'
+    '    <title size="lg">Jane Roe</title>\n    - **Party:** Example. <Cite refs={["turn12search2"]}/>\n'
+    '  </box>\n</row>'
+)
+DIL_RESULTS = [
+    {"ref": "search0", "url": "https://a.example/one?utm_source=chatgpt.com", "title": "One",
+     "attribution": "a.example"},
+    {"ref": "search1", "url": "https://b.example/uncited", "title": "Uncited", "attribution": ""},
+    {"ref": "search2", "url": "https://c.example/two", "title": "Two", "attribution": ""},
+]
+
+
+def test_conversation_citations_resolves_inline_cite_tags():
+    conv = {"answer": DIL_ANSWER, "results": DIL_RESULTS, "references": []}
+    urls = [c["url"] for c in _conversation_citations(conv)]
+    assert urls == ["https://c.example/two", "https://a.example/one?utm_source=chatgpt.com",
+                    "https://c.example/two"]
+
+
+def test_conversation_citations_keeps_the_older_format():
+    ref = {"url": "https://d.example/", "title": "D", "attribution": ""}
+    assert _conversation_citations({"answer": "Plain.", "references": [ref]}) == [ref]
+
+
+def test_strip_dil_leaves_the_prose():
+    assert _strip_dil(DIL_ANSWER) == "**Jane Roe** is a mayor.\n\nJane Roe\n- **Party:** Example."
+
+
+def _account_copy(conv):
+    session = _StubSession()
+    session.evaluate = lambda page, expression, timeout=25.0: {"conversations": [conv]}
+    return session
+
+
+def test_ask_takes_model_and_sources_from_the_account(tmp_path, monkeypatch):
+    monkeypatch.setattr(phone_chatgpt, "DEBUG_DIR", tmp_path)
+    data = {"found": True, "app": True, "servedModel": "", "text": "Jane Roe is a mayor.",
+            "url": "https://chatgpt.com/c/6ac7f2be-e838-83e9-beb1-c210c84d1ebd",
+            "citations": [], "anchors": [], "chips": ["Add to Favorites"],
+            "bodyText": "Jane Roe is a mayor."}
+    scraper = _chatgpt_scraper(data)
+    scraper._last_page = {}
+    scraper.session = _account_copy({"id": "x", "answer": DIL_ANSWER, "model": "gpt-6",
+                                     "results": DIL_RESULTS, "dil": True})
+    result = scraper.ask("who is jane roe")
+    assert result.served_model == "gpt-6"
+    assert [r.url for r in result.references] == ["https://c.example/two", "https://a.example/one"]
+    assert result.note == ""
+    assert not list(tmp_path.iterdir())
+
+
+def test_ask_keeps_the_page_reading_when_the_account_has_no_copy(tmp_path, monkeypatch):
+    monkeypatch.setattr(phone_chatgpt, "DEBUG_DIR", tmp_path)
+    data = {"found": True, "app": True, "servedModel": "gpt-5-6", "text": "Hello.",
+            "url": "https://chatgpt.com/c/6ac7f2be-e838-83e9-beb1-c210c84d1ebd",
+            "citations": [], "anchors": [], "chips": [], "bodyText": "Hello."}
+    scraper = _chatgpt_scraper(data)
+    scraper._last_page = {}
+    scraper.session = _account_copy({"id": "x", "error": "get 404"})
+    result = scraper.ask("say hello")
+    assert result.served_model == "gpt-5-6"
+    assert result.note == ""
+
+
+def test_history_result_reads_the_newer_format():
+    scraper = object.__new__(PhoneChatGPTScraper)
+    scraper.session = _StubSession()
+    result = scraper._history_result({"prompt": "who is jane roe", "answer": DIL_ANSWER,
+                                      "model": "gpt-6", "results": DIL_RESULTS, "dil": True,
+                                      "asked": 1791000000})
+    assert result.response.startswith("**Jane Roe** is a mayor.")
+    assert [r.domain for r in result.references] == ["c.example", "a.example"]

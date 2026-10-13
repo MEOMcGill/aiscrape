@@ -230,6 +230,14 @@ _CHAT_EXTRACT_JS = r"""
     turnAttrs.push(Object.fromEntries(el.getAttributeNames()
       .filter(n => n.startsWith('data-')).map(n => [n, el.getAttribute(n).slice(0, 200)])));
   }
+  // The newer renderer puts each source pill inline in the prose. Hidden for the
+  // read so its label ("Elections Alberta +2") does not end up in the answer text.
+  const pills = body ? [...body.querySelectorAll('[data-pill]')]
+    .map(p => p.closest('[data-d-component="popover-trigger"]') || p) : [];
+  const shown = pills.map(p => p.style.display);
+  pills.forEach(p => { p.style.display = 'none'; });
+  const text = body ? (body.innerText || '').trim() : '';
+  pills.forEach((p, i) => { p.style.display = shown[i]; });
   // While a turn streams the composer's send control becomes a stop control. Its
   // presence is a positive "still generating", so a slow first token is not read
   // as a finished empty answer.
@@ -250,7 +258,7 @@ _CHAT_EXTRACT_JS = r"""
     nUser: users.length,
     nAssistant: bots.length,
     streaming,
-    text: body ? (body.innerText || '').trim() : '',
+    text,
     html: body ? (body.innerHTML || '').slice(0, 200000) : '',
     anchors,
     citations,
@@ -295,6 +303,11 @@ HISTORY_PAGE = 100
 # because the work is the phone's -- a batch is that many HTTP requests made and
 # parsed on the handset. At the 25s default every batch came back "no response".
 HISTORY_TIMEOUT_S = 180.0
+
+# Reading the account's copy of one conversation right after asking it.
+ACCOUNT_COPY_TIMEOUT_S = 30.0
+
+_CONVERSATION_ID_RE = re.compile(r"/c/([0-9a-f]{8}-[0-9a-f-]{27})")
 
 # Between conversation fetches, inside the page. The account rate limits them, and a
 # batch fired off at once is enough concurrency to trip it on its own.
@@ -546,20 +559,49 @@ _HISTORY_FETCH_JS = """
         .filter(n => n && n.message && n.message.author && n.message.content);
       const text = (n) => (n.message.content.parts || [])
         .filter(x => typeof x === 'string').join('\\n').trim();
-      // The ask is the first thing the user said; the answer is the last prose the
-      // assistant produced. Everything between is tool calls and reasoning, which
+      // The ask is the first thing the user said; the answer is the prose the
+      // assistant ended on. Everything between is tool calls and reasoning, which
       // carry the same role but not the answer.
       const asks = nodes.filter(n => n.message.author.role === 'user' && text(n))
         .sort((a, b) => (a.message.create_time || 0) - (b.message.create_time || 0));
-      const said = nodes.filter(n => n.message.author.role === 'assistant'
-                                 && n.message.content.content_type === 'text' && text(n))
-        .sort((a, b) => (a.message.create_time || 0) - (b.message.create_time || 0));
+      const prose = (n) => n.message.author.role === 'assistant'
+        && n.message.content.content_type === 'text'
+        && (n.message.recipient || 'all') === 'all';
+      // The newer renderer stores one answer as several text messages, whose
+      // create_times are out of order, so they are read back along the thread from
+      // its current node instead.
+      let said = [];
+      for (let k = c.current_node; k && c.mapping[k]; k = c.mapping[k].parent) {
+        const n = c.mapping[k];
+        if (!n.message || (prose(n) && !text(n))) continue;
+        if (!prose(n)) { if (said.length) break; continue; }
+        said.unshift(n);
+      }
+      if (!said.length) {
+        said = nodes.filter(n => prose(n) && text(n))
+          .sort((a, b) => (a.message.create_time || 0) - (b.message.create_time || 0))
+          .slice(-1);
+      }
       const answer = said.length ? said[said.length - 1] : null;
       const refs = [];
-      for (const ref of ((answer && answer.message.metadata) || {}).content_references || []) {
-        for (const item of ref.items || []) {
-          if (item && item.url) refs.push({url: item.url, title: item.title || '',
-                                           attribution: item.attribution || ''});
+      for (const n of said) {
+        for (const ref of n.message.metadata.content_references || []) {
+          for (const item of ref.items || []) {
+            if (item && item.url) refs.push({url: item.url, title: item.title || '',
+                                             attribution: item.attribution || ''});
+          }
+        }
+      }
+      // The newer renderer leaves content_references empty and cites inline instead,
+      // with <Cite refs={["turnNsearchK"]}/> tags that point into these results.
+      const results = [];
+      for (const n of nodes) {
+        for (const g of n.message.metadata.search_result_groups || []) {
+          for (const e of g.entries || []) {
+            if (e && e.url && e.ref_id) results.push({
+              ref: (e.ref_id.ref_type || '') + e.ref_id.ref_index, url: e.url,
+              title: e.title || '', attribution: e.attribution || ''});
+          }
         }
       }
       return {
@@ -570,10 +612,12 @@ _HISTORY_FETCH_JS = """
         // timestamp that a series of repeats is ordered by.
         asked: asks.length ? asks[0].message.create_time : c.create_time,
         prompt: asks.length ? text(asks[0]) : '',
-        answer: answer ? text(answer) : '',
+        answer: said.map(text).join('\\n\\n'),
         model: (answer && answer.message.metadata
                 && answer.message.metadata.model_slug) || '',
         references: refs,
+        results,
+        dil: said.some(n => n.message.metadata.model_dil_v2),
       };
     } catch (e) { return {id, error: String(e)}; }
   };
@@ -805,6 +849,8 @@ class PhoneChatGPTScraper:
                 # error message, not the model's output.
                 return self._result(prompt, scraped_at,
                                     note="chatgpt failed to generate a response")
+            if data.get("app") and answer:
+                data = self._with_account_copy(data)
             references = _parse_citations(data.get("citations", []),
                                           data.get("anchors", []))
             gaps = _extraction_gaps(data, references) if answer else []
@@ -1374,6 +1420,29 @@ class PhoneChatGPTScraper:
                     f"{self.serial}: chatgpt is signed out, so it has no history to read")
         raise ChatGPTLoginError(f"{self.serial}: chatgpt.com would not open to read history")
 
+    def _with_account_copy(self, data: dict) -> dict:
+        """`data` with the model and sources the account stored for this ask added.
+
+        The newer renderer shows neither on the page: no model slug on the turn, and
+        source pills that carry only a favicon domain. The account's copy of the
+        conversation has both, so it is read from the ask's own tab. The page's
+        reading stands whenever the account's cannot be had.
+        """
+        match = _CONVERSATION_ID_RE.search(data.get("url", ""))
+        if not match:
+            return data
+        got = self.session.evaluate(
+            self._last_page, _HISTORY_FETCH_JS % (json.dumps([match.group(1)]), 0),
+            timeout=ACCOUNT_COPY_TIMEOUT_S)
+        conv = ((got or {}).get("conversations") or [{}])[0]
+        if conv.get("error") or not conv.get("answer"):
+            logger.debug(f"[{self.serial}] no account copy of {match.group(1)} "
+                         f"({conv.get('error') or (got or {}).get('error', 'no response')})")
+            return data
+        return {**data,
+                "servedModel": conv.get("model") or data.get("servedModel", ""),
+                "citations": _conversation_citations(conv) + data.get("citations", [])}
+
     def _history_result(self, conv: dict) -> ChatResult | None:
         """One recovered conversation as a `ChatResult`, or None if it holds no ask."""
         # A temporary chat was never stored and an empty one holds no ask; neither is
@@ -1382,9 +1451,11 @@ class PhoneChatGPTScraper:
             return None
         asked = datetime.fromtimestamp(_epoch(conv.get("asked")), tz=timezone.utc)
         return ChatResult(
-            provider="chatgpt", prompt=conv["prompt"], response=conv.get("answer", ""),
+            provider="chatgpt", prompt=conv["prompt"],
+            response=_strip_dil(conv.get("answer", "")) if conv.get("dil")
+            else conv.get("answer", ""),
             served_model=conv.get("model") or None,
-            references=_parse_citations(conv.get("references") or [], []),
+            references=_parse_citations(_conversation_citations(conv), []),
             scraped_at=asked.isoformat(), surface="phone_farm", serial=self.serial,
             # Said plainly, because a recovered row is not evidence the phone answered
             # today -- it is evidence the account holds an answer from whenever this is.
@@ -1615,6 +1686,42 @@ def _strip_chatgpt_utm(url: str) -> str:
     kept = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
             if not (k == "utm_source" and v == "chatgpt.com")]
     return urlunsplit(parsed._replace(query=urlencode(kept)))
+
+
+_DIL_CITE_RE = re.compile(r"<Cite\b[^<>]*>")
+_DIL_REF_RE = re.compile(r"turn\d+([a-z_]+?)(\d+)")
+_DIL_ENTITY_RE = re.compile(r'<Entity\b[^<>]*?\bvalue=\{?"([^"]*)"\}?[^<>]*>')
+_DIL_TAG_RE = re.compile(r"</?[A-Za-z][\w-]*(?:\s[^<>]*)?/?>")
+
+
+def _conversation_citations(conv: dict) -> list[dict]:
+    """A stored conversation's cited sources, in either of ChatGPT's two formats.
+
+    The older one lists them in `references`. The newer one cites with inline
+    `<Cite refs={["turn0search2"]}/>` tags in the answer, resolved here against the
+    search results by ref type and index.
+    """
+    out = list(conv.get("references") or [])
+    by_ref: dict[str, dict] = {}
+    for r in conv.get("results") or []:
+        by_ref.setdefault(r.get("ref", ""), r)
+    for tag in _DIL_CITE_RE.findall(conv.get("answer", "")):
+        for kind, index in _DIL_REF_RE.findall(tag):
+            if f"{kind}{index}" in by_ref:
+                out.append(by_ref[f"{kind}{index}"])
+    return out
+
+
+def _strip_dil(text: str) -> str:
+    """The newer renderer's answer source as plain markdown.
+
+    Entities keep their name, citations and images go, and layout tags (`<row>`,
+    `<box>`, `<title>`) give up their contents.
+    """
+    text = _DIL_ENTITY_RE.sub(lambda m: m.group(1), text)
+    text = _DIL_TAG_RE.sub("", text)
+    lines = [line.strip() for line in text.splitlines()]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
 
 def _parse_citations(citations: list[dict], anchors: list[dict]) -> list[Reference]:
