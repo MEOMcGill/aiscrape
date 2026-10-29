@@ -148,7 +148,20 @@ _EXTRACT_JS = r"""
     text: cnt.innerText || '',
     html: (cnt.innerHTML || '').slice(0, 200000),
     anchors,
+    // "Continue with this search?" -- Google holds a query that arrived by URL until
+    // it is confirmed.
+    confirm: [...document.querySelectorAll('button')]
+      .some(b => /^yes, continue$/i.test((b.innerText || '').trim())),
   });
+})()
+"""
+
+_CONFIRM_JS = r"""
+(() => {
+  const b = [...document.querySelectorAll('button')]
+    .find(b => /^yes, continue$/i.test((b.innerText || '').trim()));
+  if (b) b.click();
+  return JSON.stringify({clicked: !!b});
 })()
 """
 
@@ -1114,6 +1127,10 @@ class PhoneFarmAIOverviewScraper:
             data = self._extract_once(prompt)
             if data and data.get("found"):
                 latest = data
+                if data.get("confirm"):
+                    self._confirm()
+                    time.sleep(1.5)
+                    continue
                 cur = len(data.get("text", ""))
                 # ready once the answer meets the bar and its text length has held
                 # steady across two reads.
@@ -1135,7 +1152,17 @@ class PhoneFarmAIOverviewScraper:
             return None
         # Remembered so the ask can close its own tab afterwards; see `search`.
         self._last_target_id = page.get("id") or ""
+        self._last_page = page
         return self.session.evaluate(page, _EXTRACT_JS)
+
+    def _confirm(self) -> None:
+        """Answer Google's "Continue with this search?" with yes.
+
+        Foregrounded first: Android Chrome freezes background tabs, and a click into
+        a frozen one is lost.
+        """
+        self.session.activate(self._last_page)
+        self.session.evaluate(self._last_page, _CONFIRM_JS)
 
     def _await_results(self, prompt: str) -> dict | None:
         """Poll CDP until the plain results page for `prompt` has results.

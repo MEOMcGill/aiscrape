@@ -121,6 +121,23 @@ def test_search_reports_the_start_screen_as_a_failed_ask():
     assert result.note == "ai mode never answered the query"
 
 
+def test_await_answer_confirms_a_held_search(monkeypatch):
+    prompt = "is the economy doing well"
+    held = {"found": True, "confirm": True, "anchors": [],
+            "text": f"Continue with this search?\n{prompt}\nNo thanks\nYes, continue"}
+    answered = {"found": True, "anchors": [{"href": "https://example.com"}],
+                "text": f"AI Mode\n{prompt}\n" + "It depends on the measure. " * 20}
+    reads = iter([held, answered, answered])
+    confirms = []
+    monkeypatch.setattr("aiscrape.phone_farm.time.sleep", lambda s: None)
+    scraper = object.__new__(PhoneFarmAIOverviewScraper)
+    scraper.settle_ms, scraper.answer_timeout_s, scraper.debug = 0, 10, False
+    scraper._extract_once = lambda p: next(reads)
+    scraper._confirm = lambda: confirms.append(1)
+    assert scraper._await_answer(prompt) is answered
+    assert confirms == [1]
+
+
 def test_search_keeps_an_answer_with_no_sources():
     prompt = "is the economy doing well"
     answer = "It depends on the measure."
