@@ -176,15 +176,23 @@ _CHAT_EXTRACT_JS = r"""
   // gets the ordinary ChatGPT web app (data-message-author-role, the same markup the
   // desktop scrapers in chatbots.py drive). Everything below returns the same shape
   // either way, so only this block knows the difference.
-  const app = !!document.querySelector('[data-message-author-role], #prompt-textarea');
-  const roleAttr = app ? 'data-message-author-role' : 'data-message-role';
-  const turns = [...document.querySelectorAll('[' + roleAttr + ']')];
-  const users = turns.filter(t => t.getAttribute(roleAttr) === 'user');
-  const bots = turns.filter(t => t.getAttribute(roleAttr) === 'assistant');
+  const app = !!document.querySelector(
+    '[data-message-author-role], #prompt-textarea, [data-chatgpt-composer]');
+  // Newer app builds drop the role attribute: each message is a search unit whose
+  // key ends in its role (`fallback-turn-0:1:assistant`).
+  const units = [...document.querySelectorAll('[data-chatgpt-search-unit-key]')];
+  const roleAttr = units.length ? 'data-chatgpt-search-unit-key'
+    : app ? 'data-message-author-role' : 'data-message-role';
+  const role = t => (t.getAttribute(roleAttr) || '').split(':').pop();
+  const turns = units.length ? units : [...document.querySelectorAll('[' + roleAttr + ']')];
+  const users = turns.filter(t => role(t) === 'user');
+  const bots = turns.filter(t => role(t) === 'assistant');
   const last = bots.length ? bots[bots.length - 1] : null;
   // The markdown node is the answer without the turn's action row (Copy, Share).
-  const body = last ? (last.querySelector('[data-assistant-markdown]') || last) : null;
-  const composerEl = document.querySelector('#prompt-textarea, #mobile-composer-prompt');
+  const body = last ? (last.querySelector(
+    '[data-assistant-markdown], [data-markdown-text-style="assistant-message"]') || last) : null;
+  const composerEl = document.querySelector(
+    '#prompt-textarea, #mobile-composer-prompt, [data-chatgpt-composer] [contenteditable="true"]');
   const composerText = composerEl
     ? (composerEl.value !== undefined && composerEl.value !== null
         ? composerEl.value : (composerEl.innerText || '')).trim()
@@ -378,13 +386,14 @@ _LOGIN_STATE_JS = r"""
   return JSON.stringify({
     url: location.href,
     // Logged in: the composer is there and the logged-out calls to action are not.
-    composer: !!document.querySelector('#mobile-composer-prompt, #prompt-textarea'),
+    composer: !!document.querySelector(
+    '#prompt-textarea, #mobile-composer-prompt, [data-chatgpt-composer] [contenteditable="true"]'),
     // The signed-in app, by furniture only it has. Needed as well as the composer
     // because the app paints its shell first and its composer a moment later, and
     // in that gap a finished sign-in looked like a page still loading.
     appShell: !!document.querySelector(
       '[data-testid="model-switcher-dropdown-button"], [data-testid="composer-plus-btn"], '
-      + '#prompt-textarea'),
+      + '#prompt-textarea, [data-chatgpt-composer]'),
     loginButton: !!byText(/^log in$/i),
     signupButton: !!byText(/^sign up for free$/i),
     googleButton: !!byText(/^continue with google$/i),
@@ -485,7 +494,8 @@ _FOCUS_BIRTHDAY_JS = r"""
 _SEND_JS = r"""
 (() => {
   const b = document.querySelector('button[data-testid="send-button"]')
-        || document.querySelector('button[data-testid="composer-send-button"]');
+        || document.querySelector('button[data-testid="composer-send-button"]')
+        || document.querySelector('[data-chatgpt-composer] button[type="submit"]');
   if (!b || b.disabled) return JSON.stringify({sent: false});
   b.click();
   return JSON.stringify({sent: true});
@@ -709,7 +719,8 @@ _PREPARE_JS = r"""
     // Has the app itself painted? Reported separately from the clicks because a tab
     // that answers CDP is not yet a tab that has rendered its cookie banner, and
     // "no banner" means "already accepted" only once this is true.
-    ready: !!document.querySelector('#mobile-composer-prompt, #prompt-textarea'),
+    ready: !!document.querySelector(
+    '#prompt-textarea, #mobile-composer-prompt, [data-chatgpt-composer] [contenteditable="true"]'),
     banner: !!cookies,
   });
 })()
