@@ -700,6 +700,21 @@ class PhoneBackend:
             key=prompt,
         )
 
+    async def chat_conversation(self, prompt: str, n_turns: int, next_turn):
+        """A multi-turn ChatGPT conversation opening with `prompt` (`ask_conversation`).
+
+        Rotates like `chat`, on turn 1 only: a conversation walled before its first
+        answer never happened and goes to another phone, while one that stops later
+        is returned as it is -- re-asking it elsewhere would start a second, different
+        conversation for the same scheduled ask.
+        """
+        return await self._ask_rotating(
+            "chatgpt",
+            lambda: self._chatgpt.ask_conversation(prompt, n_turns, next_turn),
+            lambda r: bool(r.response),
+            key=prompt,
+        )
+
     async def claude(self, prompt: str):
         """Claude's answer to `prompt`, rotating past a usage limit or a dry streak.
 

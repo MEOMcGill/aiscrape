@@ -100,12 +100,68 @@ class ChatResult:
     # Which machinery answered ("phone_farm"), and which handset, when one did.
     surface: str = ""
     serial: str = ""
+    # Multi-turn asks (`ask_conversation`). A single ask is turn 1 of a one-turn
+    # conversation, so these defaults describe it without anything being set.
+    turn: int = 1
+    # The page the conversation lives at once sent (chatgpt.com/c/<uuid>), which is
+    # what ties the turns of one conversation together in the account's history.
+    conversation_url: str = ""
+    # How a follow-up turn's prompt was written: generator model, prompt-template
+    # hash, style, and the transcript the generator saw. Empty on turn 1, whose
+    # prompt came from the bank. See `aiscrape.followups`.
+    followup: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), default=str)
+
+
+@dataclass
+class FollowUp:
+    """The next user message of a conversation, and how it was written."""
+
+    text: str
+    # Provenance kept on the turn's row: re-running a generator does not reproduce
+    # its text, so the stored text and this record are the only account of it.
+    meta: dict = field(default_factory=dict)
+
+
+@dataclass
+class Conversation:
+    """The turns of one multi-turn ask, in order.
+
+    `turns[0]` is the bank's prompt; each later turn's prompt came from a follow-up
+    generator. A conversation that stopped early (a turn walled or came back empty,
+    or the generator gave up) keeps the turns it has, with `complete` False and
+    `stop_reason` saying why -- the turns that were answered are still evidence.
+    """
+
+    turns: list[ChatResult] = field(default_factory=list)
+    planned: int = 1
+    stop_reason: str = ""
+
+    @property
+    def complete(self) -> bool:
+        return (len(self.turns) == self.planned and not self.stop_reason
+                and all(t.response for t in self.turns))
+
+    # The pool rotates handsets on these, exactly as on a `ChatResult`. Only the
+    # first turn decides: a wall on turn 1 means no conversation happened and the
+    # prompt belongs on another phone; a wall later is a conversation that stopped
+    # partway, and re-asking it elsewhere would give a second, different turn 1.
+    @property
+    def blocked(self) -> bool:
+        return bool(self.turns) and self.turns[0].blocked
+
+    @property
+    def note(self) -> str:
+        return self.turns[0].note if self.turns else self.stop_reason
+
+    @property
+    def response(self) -> str:
+        return self.turns[0].response if self.turns else ""
 
 
 def now_iso() -> str:
