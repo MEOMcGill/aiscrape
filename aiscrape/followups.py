@@ -9,6 +9,7 @@ Backends:
 
   * **stub**   -- canned follow-ups, no model. For testing the phone side end to end
                   without credentials; rows say `followup_model: "stub"`.
+  * **anthropic** -- the Anthropic Messages API (Haiku), `ANTHROPIC_API_KEY`.
   * **claude** -- `claude -p --model haiku`, the Claude Code CLI on this machine.
   * **openrouter** -- the OpenRouter chat-completions API, `OPENROUTER_API_KEY`.
 
@@ -265,6 +266,42 @@ class ClaudeCLIGenerator(FollowUpGenerator):
 
 
 @dataclass
+class AnthropicGenerator(FollowUpGenerator):
+    """The Anthropic Messages API directly. Key from `ANTHROPIC_API_KEY`.
+
+    Same model as `claude -p --model haiku`, without needing the Claude Code CLI
+    (or its sign-in) on the machine that runs the scraper.
+    """
+
+    model: str = field(default_factory=lambda: os.environ.get(
+        "FOLLOWUP_ANTHROPIC_MODEL", "claude-haiku-5-5"))
+    url: str = "https://api.anthropic.com/v1/messages"
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.backend = "anthropic"
+
+    def available(self) -> bool:
+        return bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+    def _complete(self, system: str, user: str) -> tuple[str, str]:
+        body = json.dumps({"model": self.model, "max_tokens": 300, "system": system,
+                           "messages": [{"role": "user", "content": user}]}).encode()
+        req = urllib.request.Request(self.url, data=body, headers={
+            "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout_s) as r:
+                out = json.load(r)
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"anthropic {e.code}: {e.read()[:200]!r}") from None
+        text = "".join(b.get("text", "") for b in out.get("content", [])
+                       if b.get("type") == "text")
+        return text, out.get("model", self.model)
+
+
+@dataclass
 class OpenRouterGenerator(FollowUpGenerator):
     """OpenRouter's chat-completions API. Key from `OPENROUTER_API_KEY`."""
 
@@ -294,18 +331,18 @@ class OpenRouterGenerator(FollowUpGenerator):
         return out["choices"][0]["message"]["content"], out.get("model", self.model)
 
 
-BACKENDS = {"stub": StubGenerator, "claude": ClaudeCLIGenerator,
-            "openrouter": OpenRouterGenerator}
+BACKENDS = {"stub": StubGenerator, "anthropic": AnthropicGenerator,
+            "claude": ClaudeCLIGenerator, "openrouter": OpenRouterGenerator}
 
 
 def make_generator(backend: str = "auto", **kw) -> FollowUpGenerator | None:
     """A generator for `backend`, or None if it cannot run here.
 
-    "auto" tries claude, then openrouter, and never falls back to the stub: a
+    "auto" tries the Anthropic API, then claude -p, then openrouter, and never falls back to the stub: a
     production run without credentials should drop to single-turn asks and say so,
     not quietly send canned follow-ups.
     """
-    order = ["claude", "openrouter"] if backend == "auto" else [backend]
+    order = ["anthropic", "claude", "openrouter"] if backend == "auto" else [backend]
     for name in order:
         if name not in BACKENDS:
             raise ValueError(f"unknown follow-up backend {name!r}; one of {sorted(BACKENDS)} or auto")

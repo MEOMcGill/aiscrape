@@ -218,6 +218,7 @@ def test_clean_strips_labels_and_quotes():
 
 def test_auto_without_credentials_is_none(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.setattr(followups.shutil, "which", lambda name: None)
     assert followups.make_generator("auto") is None
     assert isinstance(followups.make_generator("stub"), followups.StubGenerator)
