@@ -29,7 +29,7 @@ from aiscrape.exceptions import (
     RateLimitError,
     SessionExpiredError,
 )
-from aiscrape.models import ChatResult, Task
+from aiscrape.models import ChatResult, Conversation, FollowUp, Task
 from aiscrape.utils import PROVIDERS
 from aiscrape.worker import Worker
 from aiscrape.worker_pool import WorkerPool
@@ -90,6 +90,8 @@ __all__ = [
     "PhoneChromeSession",
     "PhoneFarmAIOverviewScraper",
     "PhoneChatGPTScraper",
+    "Conversation",
+    "FollowUp",
     "PhoneClaudeScraper",
     "ClaudeLoginError",
     "ClaudeSignedOutError",

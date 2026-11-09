@@ -80,13 +80,14 @@ import argparse
 import json
 import re
 import time
+from typing import Callable
 from datetime import date, datetime, timezone
 from urllib.parse import parse_qsl, quote_plus, urlencode, urlsplit, urlunsplit
 
 from .chatbots import RATE_LIMIT_TEXT_RE
 from .google_aimode import DEBUG_DIR, Reference, _clean_title, _domain, _real_url
 from .logger import logger
-from .models import ChatResult, now_iso
+from .models import ChatResult, Conversation, FollowUp, now_iso
 from .phone_farm import DEFAULT_CDP_PORT, PhoneChromeSession
 
 # Asking is a URL: the mobile page fills its composer from `q` and submits.
@@ -503,6 +504,32 @@ _SEND_JS = r"""
 """
 
 
+# Focus the conversation's composer, caret at the end, ready for `insert_text`.
+# Reports what is already in it, so a follow-up typed on a first attempt whose send
+# did not take is not typed a second time.
+_FOCUS_COMPOSER_JS = r"""
+(() => {
+  const el = document.querySelector(
+    '#prompt-textarea, #mobile-composer-prompt, [data-chatgpt-composer] [contenteditable="true"]');
+  if (!el) return JSON.stringify({ok: false});
+  el.focus();
+  if (el.isContentEditable) {
+    const r = document.createRange();
+    r.selectNodeContents(el);
+    r.collapse(false);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(r);
+  }
+  const text = el.value !== undefined && el.value !== null ? el.value : (el.innerText || '');
+  return JSON.stringify({ok: true, text: (text || '').trim()});
+})()
+"""
+
+# How long a follow-up gets to show up as a sent user turn before it is retyped.
+FOLLOWUP_SEND_TIMEOUT_S = 12
+
+
 # ── reading an account's own history ─────────────────────────────────────────
 #
 # Every signed-in ask leaves a conversation behind, and the account keeps it. That
@@ -806,8 +833,12 @@ class PhoneChatGPTScraper:
 
     # -- asking -----------------------------------------------------------------
 
-    def ask(self, prompt: str) -> ChatResult:
+    def ask(self, prompt: str, *, keep_tab: bool = False) -> ChatResult:
         """Put one prompt to ChatGPT on the phone, in a fresh conversation.
+
+        `keep_tab` leaves the conversation's tab open afterwards, for a caller that
+        goes on to send follow-ups in it (`ask_conversation`); otherwise the tab is
+        closed on the way out, as every single ask always has.
 
         A verification wall is retried once on this handset, re-warming the site
         first, before it is reported as `blocked`. The wall is usually about *when*
@@ -816,15 +847,17 @@ class PhoneChatGPTScraper:
         a handset for that would burn phones for a condition a second attempt clears.
         """
         self.session.require_open()
-        result = self._ask_once(prompt)
+        result = self._ask_once(prompt, keep_tab=keep_tab)
         if result.blocked and result.note.startswith("chatgpt verification"):
             logger.info(f"[{self.serial}] chatgpt verification wall; re-warming and "
                         "asking once more")
+            if keep_tab:
+                self._close_last_tab()
             self.prepare(force=True)
-            result = self._ask_once(prompt)
+            result = self._ask_once(prompt, keep_tab=keep_tab)
         return result
 
-    def _ask_once(self, prompt: str) -> ChatResult:
+    def _ask_once(self, prompt: str, keep_tab: bool = False) -> ChatResult:
         self.prepare()
         # Before every ask, not once per session: the display times out mid-run and
         # the keyguard comes back over Chrome. A tab behind it is frozen, so the ask
@@ -841,51 +874,194 @@ class PhoneChatGPTScraper:
             if data is None:
                 return self._result(prompt, scraped_at,
                                     note="no ChatGPT conversation found for this ask")
-
-            page_text = data.get("bodyText", "") or ""
-            wall = _blocked_reason(page_text)
-            if wall:
-                # Not an answer and not a refusal: the ask never reached a model. Same
-                # treatment as a Google CAPTCHA, so the pool rotates handsets.
-                return self._result(prompt, scraped_at, blocked=True, note=wall,
-                                    rate_limited="limit" in wall)
-            if RATE_LIMIT_TEXT_RE.search(page_text):
-                return self._result(prompt, scraped_at, blocked=True, rate_limited=True,
-                                    note="chatgpt rate limit banner")
-
-            answer = _clean_answer(data.get("text", ""))
-            if _TURN_ERROR_RE.search(answer):
-                # ChatGPT failed to generate. Reported as an ask that produced
-                # nothing rather than stored as an answer -- it is the product's
-                # error message, not the model's output.
-                return self._result(prompt, scraped_at,
-                                    note="chatgpt failed to generate a response")
-            if data.get("app") and answer:
-                data = self._with_account_copy(data)
-            references = _parse_citations(data.get("citations", []),
-                                          data.get("anchors", []))
-            gaps = _extraction_gaps(data, references) if answer else []
-            if gaps:
-                # The answer is kept: its text is complete, and `history` can
-                # restore the model and sources from the account afterwards.
-                self._snapshot(prompt, data, gaps)
-            return self._result(
-                prompt, scraped_at, response=answer,
-                # Only the signed-in app names its model; anonymous stays None.
-                served_model=data.get("servedModel") or None,
-                memory_enabled=self.memory_enabled if data.get("app") else False,
-                references=references,
-                note="; ".join(gaps) if answer else "the answer turn rendered empty",
-            )
+            return self._finish(prompt, scraped_at, data)
         finally:
             # One tab per ask, closed on the way out however we leave -- Chrome keeps
             # tabs across sessions, so without this a phone accumulates one tab per ask
             # ever made, and a long tab list is exactly what makes the right tab slow to
-            # find (the lesson `phone_farm._ai_mode_page` was written for).
-            self._close_last_tab()
+            # find (the lesson `phone_farm._ai_mode_page` was written for). A
+            # conversation keeps it until its last turn and closes it then.
+            if not keep_tab:
+                self._close_last_tab()
+
+    def _finish(self, prompt: str, scraped_at: str, data: dict, **extra) -> ChatResult:
+        """Turn one read of an answered turn into its `ChatResult`.
+
+        Shared by a single ask and by every turn of a conversation, so a follow-up's
+        answer is judged -- walls, rate limits, generation errors, citations, the
+        account copy -- exactly as a first answer is.
+        """
+        page_text = data.get("bodyText", "") or ""
+        wall = _blocked_reason(page_text)
+        if wall:
+            # Not an answer and not a refusal: the ask never reached a model. Same
+            # treatment as a Google CAPTCHA, so the pool rotates handsets.
+            return self._result(prompt, scraped_at, **extra, blocked=True, note=wall,
+                                rate_limited="limit" in wall)
+        if RATE_LIMIT_TEXT_RE.search(page_text):
+            return self._result(prompt, scraped_at, **extra, blocked=True, rate_limited=True,
+                                note="chatgpt rate limit banner")
+
+        answer = _clean_answer(data.get("text", ""))
+        if _TURN_ERROR_RE.search(answer):
+            # ChatGPT failed to generate. Reported as an ask that produced
+            # nothing rather than stored as an answer -- it is the product's
+            # error message, not the model's output.
+            return self._result(prompt, scraped_at, **extra,
+                                note="chatgpt failed to generate a response")
+        if data.get("app") and answer:
+            data = self._with_account_copy(data)
+        references = _parse_citations(data.get("citations", []),
+                                      data.get("anchors", []))
+        gaps = _extraction_gaps(data, references) if answer else []
+        if gaps:
+            # The answer is kept: its text is complete, and `history` can
+            # restore the model and sources from the account afterwards.
+            self._snapshot(prompt, data, gaps)
+        return self._result(
+            prompt, scraped_at, **extra, response=answer,
+            # Only the signed-in app names its model; anonymous stays None.
+            served_model=data.get("servedModel") or None,
+            memory_enabled=self.memory_enabled if data.get("app") else False,
+            references=references,
+            note="; ".join(gaps) if answer else "the answer turn rendered empty",
+        )
 
     def ask_many(self, prompts: list[str]) -> list[ChatResult]:
         return [self.ask(p) for p in prompts]
+
+    # -- conversations ----------------------------------------------------------
+
+    def ask_conversation(self, prompt: str, n_turns: int = 1,
+                         next_turn: Callable[[list[ChatResult]], FollowUp | None] | None = None,
+                         ) -> Conversation:
+        """Hold an `n_turns`-turn conversation that opens with `prompt`.
+
+        Turn 1 is an ordinary `ask`, except that its tab stays open. Each later turn
+        asks `next_turn` for the next user message given the turns so far, types it
+        into the same conversation's composer, sends it, and reads the answer that
+        comes back -- through the same checks as a first answer (`_finish`).
+
+        The conversation stops early, keeping the turns it has, when a turn is walled,
+        rate-limited or comes back empty, or when `next_turn` returns None or raises:
+        carrying on past a broken turn would put a follow-up to an answer that does
+        not exist. With `n_turns=1` this is exactly `ask`.
+        """
+        n_turns = max(1, int(n_turns or 1))
+        conv = Conversation(planned=n_turns)
+        if n_turns > 1 and next_turn is None:
+            raise ValueError("a conversation of more than one turn needs `next_turn`")
+        first = self.ask(prompt, keep_tab=n_turns > 1)
+        first.conversation_url = self._conversation_url()
+        conv.turns.append(first)
+        if n_turns == 1:
+            return conv
+        try:
+            while len(conv.turns) < n_turns:
+                last = conv.turns[-1]
+                if last.blocked or not last.response:
+                    conv.stop_reason = (f"turn {last.turn} "
+                                        f"{'blocked' if last.blocked else 'unanswered'}"
+                                        f"{': ' + last.note if last.note else ''}")
+                    break
+                try:
+                    follow = next_turn(list(conv.turns))
+                except Exception as e:  # noqa: BLE001 — a generator failure ends the conversation, not the run
+                    conv.stop_reason = f"followup generation failed: {type(e).__name__}: {str(e)[:160]}"
+                    break
+                if follow is None or not (follow.text or "").strip():
+                    conv.stop_reason = "followup generation returned nothing"
+                    break
+                conv.turns.append(self._ask_followup(prompt, follow, turn=len(conv.turns) + 1))
+            last = conv.turns[-1]
+            if not conv.stop_reason and (last.blocked or not last.response):
+                conv.stop_reason = (f"turn {last.turn} "
+                                    f"{'blocked' if last.blocked else 'unanswered'}"
+                                    f"{': ' + last.note if last.note else ''}")
+        finally:
+            self._close_last_tab()
+        return conv
+
+    def _conversation_url(self) -> str:
+        url = (self._last_page or {}).get("url", "") or ""
+        return url if _CONVERSATION_ID_RE.search(url) else ""
+
+    def _ask_followup(self, first_prompt: str, follow: FollowUp, *, turn: int) -> ChatResult:
+        """Send `follow` into the open conversation and read its answer as turn `turn`."""
+        scraped_at = now_iso()
+        extra = {"turn": turn, "followup": dict(follow.meta)}
+        self.session.ensure_visible()
+        before = self._extract_once(first_prompt)
+        if not before:
+            return self._result(follow.text, scraped_at, **extra,
+                                note="conversation tab lost before the follow-up")
+        n_assistant = int(before.get("nAssistant") or 0)
+        n_user = int(before.get("nUser") or 0)
+        if not self._send_followup(first_prompt, follow.text, n_user):
+            return self._result(follow.text, scraped_at, **extra,
+                                note="follow-up could not be sent")
+        data = self._await_followup_answer(first_prompt, n_assistant)
+        if data is None:
+            return self._result(follow.text, scraped_at, **extra,
+                                note="no new answer turn after the follow-up")
+        extra["conversation_url"] = self._conversation_url()
+        return self._finish(follow.text, scraped_at, data, **extra)
+
+    def _send_followup(self, first_prompt: str, text: str, n_user: int) -> bool:
+        """Type `text` into the conversation's composer and press send.
+
+        Typed through CDP (`insert_text`), not adb, so it lands in the tab whatever
+        the display shows, and React sees a real edit. Confirmed by the user-turn
+        count going up, since a click on a send button React has not enabled yet is
+        silently dropped; tried twice.
+        """
+        page = self._last_page
+        for attempt in range(2):
+            if not page:
+                return False
+            self.session.activate(page)
+            focused = self.session.evaluate(page, _FOCUS_COMPOSER_JS) or {}
+            if not focused.get("ok"):
+                logger.debug(f"[{self.serial}] no composer to type the follow-up into")
+                return False
+            if not _normalise(focused.get("text", "")):
+                if not self.session.insert_text(page, text):
+                    return False
+            deadline = time.monotonic() + FOLLOWUP_SEND_TIMEOUT_S
+            while time.monotonic() < deadline:
+                time.sleep(0.5)
+                self.session.evaluate(page, _SEND_JS)
+                time.sleep(1.0)
+                data = self._extract_once(first_prompt)
+                if data and int(data.get("nUser") or 0) > n_user:
+                    return True
+                page = self._last_page or page
+            logger.info(f"[{self.serial}] follow-up not sent (attempt {attempt + 1})")
+        return False
+
+    def _await_followup_answer(self, first_prompt: str, n_assistant_before: int) -> dict | None:
+        """Poll until a *new* assistant turn has appeared and stopped growing.
+
+        `_await_answer`'s rule is not enough here: right after a follow-up is sent
+        the last assistant turn on the page is still the previous one, already
+        steady, and would be returned as this turn's answer. So nothing counts until
+        the assistant-turn count has gone past what it was before sending.
+        """
+        deadline = time.monotonic() + self.answer_timeout_s
+        last_len, latest = -1, None
+        while time.monotonic() < deadline:
+            data = self._extract_once(first_prompt)
+            if data:
+                if _blocked_reason(data.get("bodyText", "") or ""):
+                    return data
+                if int(data.get("nAssistant") or 0) > n_assistant_before:
+                    latest = data
+                    current = len(data.get("text", "") or "")
+                    if current and not data.get("streaming") and current == last_len:
+                        return data
+                    last_len = current
+            time.sleep(1.5)
+        return latest
 
     def prepare(self, force: bool = False) -> None:
         """Open chatgpt.com, clear the banners, and let it clear its anti-bot check.
